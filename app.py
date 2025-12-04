@@ -51,7 +51,7 @@ def pushover_notify(title: str, message: str):
         "title": title,
         "message": message,
         "priority": 0,
-        "sound": "belll",
+        "sound": "cash",
     }
     if PUSHOVER_DEVICE:
         data["device"] = PUSHOVER_DEVICE
@@ -177,6 +177,18 @@ def qtile(values: List[float], q: float):
     return float(np.quantile(arr, q))
 
 
+def bollinger(closes: List[float], period: int = 20, k: float = 2.0):
+    arr = np.array(closes, dtype=float)
+    if len(arr) < period:
+        return float("nan"), float("nan"), float("nan")
+    window = arr[-period:]
+    ma = window.mean()
+    std = window.std()
+    upper = ma + k * std
+    lower = ma - k * std
+    return float(lower), float(ma), float(upper)
+
+
 #############################
 # Bybit Client (public REST v5)
 #############################
@@ -199,9 +211,6 @@ class BybitClient:
             return None
 
     def get_ticker(self, symbol: str) -> Dict[str, float]:
-        """
-        Spot ticker: /v5/market/tickers?category=spot&symbol=ETHUSDT
-        """
         data = self._get("/v5/market/tickers", {
             "category": "spot",
             "symbol": symbol,
@@ -212,9 +221,6 @@ class BybitClient:
         return {"last": float(last_str)}
 
     def _map_interval(self, interval: str) -> str:
-        """
-        Map internal interval ("4h", "1d") -> Bybit v5 interval.
-        """
         mapping = {
             "1m": "1",
             "3m": "3",
@@ -232,10 +238,6 @@ class BybitClient:
         return mapping.get(interval, interval)
 
     def get_ohlcv(self, symbol: str, interval: str, limit: int = 200) -> List[Dict[str, Any]]:
-        """
-        Spot kline: /v5/market/kline?category=spot&symbol=ETHUSDT&interval=240
-        Response list: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
-        """
         bybit_interval = self._map_interval(interval)
         limit = min(limit, 200)
         data = self._get("/v5/market/kline", {
@@ -247,7 +249,6 @@ class BybitClient:
         if not data or "result" not in data or not data["result"].get("list"):
             return []
         candles = []
-        # list is sorted latest->oldest or oldest->latest? Doc: usually newest first
         for item in reversed(data["result"]["list"]):
             candles.append({
                 "timestamp": int(item[0]),
@@ -260,11 +261,6 @@ class BybitClient:
         return candles
 
     def get_balance(self, asset: str) -> float:
-        """
-        Ở bản Bybit này, để đơn giản và không cần API key,
-        ta không gọi balance thực, mà dùng INITIAL_SPOT_ETH từ ENV.
-        Hàm này chỉ giữ cho interface giống các phiên bản trước.
-        """
         if asset == "ETH":
             return INITIAL_SPOT_ETH
         return 0.0
@@ -347,13 +343,13 @@ class DynamicConfigBuilder:
         btc_rsi_oversold = qtile(btc_rsi_4h_series, 0.2)
 
         # BTC dump level (MA20 - 1.5*ATR) trên 1D
-        daily = self.h.client.get_ohlcv("BTCUSDT", "1d", 60)
-        if not daily:
+        daily_btc = self.h.client.get_ohlcv("BTCUSDT", "1d", 60)
+        if not daily_btc:
             btc_dump_level = 90000.0
         else:
-            closes = [c["close"] for c in daily]
-            highs = [c["high"] for c in daily]
-            lows = [c["low"] for c in daily]
+            closes = [c["close"] for c in daily_btc]
+            highs = [c["high"] for c in daily_btc]
+            lows = [c["low"] for c in daily_btc]
             if len(closes) < 20:
                 btc_dump_level = closes[-1] * 0.92
             else:
@@ -361,12 +357,14 @@ class DynamicConfigBuilder:
                 atr14 = calc_atr(highs, lows, closes)
                 btc_dump_level = ma20 - 1.5 * atr14
 
-        # Buyback zone ETH trên 4H
+        # Buyback zone + Bollinger ETH trên 4H
         eth_4h = self.h.client.get_ohlcv("ETHUSDT", "4h", 120)
         closes_4h = [c["close"] for c in eth_4h] if eth_4h else []
-        if len(closes_4h) < 10:
-            buyback_low, buyback_high = 0, 0
-            sell_spot_eth_price_min = 0
+
+        if len(closes_4h) < 30:
+            buyback_low, buyback_high = 0.0, 0.0
+            sell_spot_eth_price_min = 0.0
+            bb_lower, bb_mid, bb_upper = float("nan"), float("nan"), float("nan")
         else:
             recent = closes_4h[-60:]
             local_low = min(recent)
@@ -376,6 +374,8 @@ class DynamicConfigBuilder:
             buyback_low = (local_low + fib50) / 2
             buyback_high = fib618
             sell_spot_eth_price_min = local_high - 0.2 * (local_high - local_low)
+
+            bb_lower, bb_mid, bb_upper = bollinger(closes_4h, period=20, k=2.0)
 
         # Volatility → max LTV
         vol = realized_vol(closes_4h) if closes_4h else float("nan")
@@ -404,7 +404,7 @@ class DynamicConfigBuilder:
             ethbtc_breakdown = 0.0
 
         # ETHBTC regime từ 1D
-        ethbtc_1d = self.h.client.get_ohlcv("ETHBTC", "1d", 120)
+        ethbtc_1d = self.h.client.get_ohlcv("ETHBTC", "1d", 220)
         ethbtc_daily_closes = [c["close"] for c in ethbtc_1d] if ethbtc_1d else []
         if ethbtc_daily_closes:
             ethbtc_rsi_1d = calc_rsi(ethbtc_daily_closes)
@@ -423,6 +423,16 @@ class DynamicConfigBuilder:
             ethbtc_rsi_1d = float("nan")
             ethbtc_regime = "neutral"
 
+        # MA200 1D cho ETH
+        eth_1d = self.h.client.get_ohlcv("ETHUSDT", "1d", 220)
+        eth_1d_closes = [c["close"] for c in eth_1d] if eth_1d else []
+        if len(eth_1d_closes) >= 200:
+            eth_ma200_1d = sum(eth_1d_closes[-200:]) / 200
+        elif eth_1d_closes:
+            eth_ma200_1d = eth_1d_closes[-1]
+        else:
+            eth_ma200_1d = 0.0
+
         conf = {
             "eth_rsi_overbought_4h": eth_rsi_overbought,
             "eth_rsi_oversold_4h": eth_rsi_oversold,
@@ -435,12 +445,16 @@ class DynamicConfigBuilder:
             "sell_spot_eth_price_min": sell_spot_eth_price_min,
             "ethbtc_regime": ethbtc_regime,
             "ethbtc_rsi_1d": ethbtc_rsi_1d,
+            "eth_bb_lower_4h": bb_lower,
+            "eth_bb_mid_4h": bb_mid,
+            "eth_bb_upper_4h": bb_upper,
+            "eth_ma200_1d": eth_ma200_1d,
         }
         return conf
 
 
 #############################
-# Strategy (with trailing)
+# Strategy (with trailing + cooldown)
 #############################
 
 class EthStrategy:
@@ -452,15 +466,14 @@ class EthStrategy:
         self.trailing_active = False
         self.trailing_peak = None
 
+        # SELL cooldown
+        self.cooldown_secs = 4 * 60 * 60  # 4h
+        self.last_sell_ts: float = 0.0
+
     def update_conf(self, conf: Dict[str, Any]):
         self.conf = conf
 
     def _update_trailing(self, price: float) -> Optional[Dict[str, Any]]:
-        """
-        Trailing stop logic:
-        - Khi active: cập nhật peak nếu giá tăng
-        - Nếu giá rơi dưới peak * (1 - TRAILING_PCT) → trigger SELL
-        """
         if not self.trailing_active or self.trailing_peak is None:
             return None
         if price > self.trailing_peak:
@@ -468,7 +481,7 @@ class EthStrategy:
             return None
         trigger_price = self.trailing_peak * (1 - TRAILING_PCT)
         if price <= trigger_price:
-            # tắt trailing sau khi trigger
+            # trailing stop hit → tắt trailing, trả info cho caller
             self.trailing_active = False
             peak = self.trailing_peak
             self.trailing_peak = None
@@ -485,9 +498,15 @@ class EthStrategy:
             self.trailing_peak = price
 
     def should_sell_spot(self, m: "MarketState", p: "PositionState") -> Optional[Dict]:
-        # 1. Nếu đã bật trailing, check xem có trigger chưa
+        # 1. Nếu trailing đang active → check trigger
         trailing = self._update_trailing(m.eth_price)
         if trailing and trailing.get("triggered"):
+            # Check cooldown SELL 4h
+            now = time.time()
+            if now - self.last_sell_ts < self.cooldown_secs:
+                # Trong thời gian cooldown → bỏ qua SELL lần này
+                return None
+
             size = min(30.0, p.spot_eth * 0.3)
             if size <= 0:
                 return None
@@ -502,20 +521,30 @@ class EthStrategy:
             }
 
         # 2. Nếu chưa trailing, check điều kiện để bật trailing
-        min_price = self.conf.get("sell_spot_eth_price_min", 0)
+        min_price = self.conf.get("sell_spot_eth_price_min", 0.0)
         if m.eth_price < min_price or min_price <= 0:
             self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
             return None
 
-        # Nếu ETHBTC đang bull regime → hạn chế swing sell
+        # Filter: ETHBTC bull regime → hạn chế swing SELL
         if self.conf.get("ethbtc_regime") == "bull":
             self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
             return None
 
-        rsi_hot = m.eth_rsi_4h >= self.conf["eth_rsi_overbought_4h"]
+        # Điều kiện Bollinger: ưu tiên chỉ bật trailing khi giá chạm near upper band
+        bb_upper = self.conf.get("eth_bb_upper_4h", float("nan"))
+        if not isnan(bb_upper) and m.eth_price < bb_upper:
+            self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
+            return None
+
+        rsi_hot = (
+            not isnan(m.eth_rsi_4h)
+            and not isnan(self.conf.get("eth_rsi_overbought_4h", float("nan")))
+            and m.eth_rsi_4h >= self.conf["eth_rsi_overbought_4h"]
+        )
 
         macd_peak = False
-        if self.prev_eth_macd_hist_4h is not None:
+        if self.prev_eth_macd_hist_4h is not None and not isnan(m.eth_macd_hist_4h):
             macd_peak = (
                 self.prev_eth_macd_hist_4h > 0
                 and m.eth_macd_hist_4h > 0
@@ -531,7 +560,7 @@ class EthStrategy:
         self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
 
         if (rsi_hot or macd_peak) and (bad_ethbtc or bad_btc):
-            # Thay vì sell ngay → bật trailing
+            # Điều kiện đủ kém → bật trailing (chưa SELL ngay)
             self._maybe_start_trailing(m.eth_price)
             return None
 
@@ -551,7 +580,14 @@ class EthStrategy:
         if m.btc_price < self.conf["btc_dump_level"] * 0.95:
             return None
 
-        if m.eth_rsi_4h > self.conf["eth_rsi_overbought_4h"]:
+        if not isnan(self.conf.get("eth_rsi_overbought_4h", float("nan"))):
+            if m.eth_rsi_4h > self.conf["eth_rsi_overbought_4h"]:
+                return None
+
+        # Ưu tiên buyback gần lower BB
+        bb_lower = self.conf.get("eth_bb_lower_4h", float("nan"))
+        if not isnan(bb_lower) and m.eth_price > bb_lower:
+            # giá chưa về tới lower band => có thể bỏ qua buyback lần này
             return None
 
         return {
@@ -562,6 +598,7 @@ class EthStrategy:
                 "buyback_zone": (low, high),
                 "btc_price": m.btc_price,
                 "eth_rsi_4h": m.eth_rsi_4h,
+                "bb_lower_4h": bb_lower,
             },
         }
 
@@ -583,7 +620,12 @@ class EthStrategy:
         if low <= 0 or high <= 0:
             return None
 
-        # Chỉ vay-mua thêm khi ETH đang nằm vùng chiết khấu
+        # Filter: chỉ vay khi ETH trên MA200 1D
+        ma200 = self.conf.get("eth_ma200_1d", 0.0)
+        if ma200 > 0 and m.eth_price < ma200:
+            return None
+
+        # Chỉ vay-mua thêm khi ETH đang trong/ dưới vùng chiết khấu
         if m.eth_price > high:
             return None
 
@@ -607,6 +649,7 @@ class EthStrategy:
                 "btc_price": m.btc_price,
                 "ethbtc_price": m.ethbtc_price,
                 "max_ltv": self.conf.get("max_ltv", 0.3),
+                "eth_ma200_1d": ma200,
             },
         }
 
@@ -621,8 +664,9 @@ class EthStrategy:
         if m.eth_price < target_price:
             return None
 
-        if m.eth_rsi_4h < self.conf["eth_rsi_overbought_4h"]:
-            return None
+        if not isnan(self.conf.get("eth_rsi_overbought_4h", float("nan"))):
+            if m.eth_rsi_4h < self.conf["eth_rsi_overbought_4h"]:
+                return None
 
         buffer = 1.01
         size_to_sell = (p.loan_usdt * buffer) / m.eth_price
@@ -662,8 +706,7 @@ class EthBot:
         self.conf_update_interval = 4 * 60 * 60  # 4h
 
     def update_position(self):
-        # Bạn có thể đọc lại số ETH từ ENV, hoặc nếu muốn có Bybit API riêng
-        # cho balance thì thay thế chỗ này.
+        # nếu sau này bạn muốn đọc balance thật từ ENV khác thì chỉnh lại chỗ này
         self.position.spot_eth = INITIAL_SPOT_ETH
 
     def build_market_state(self) -> MarketState:
@@ -747,6 +790,8 @@ class EthBot:
             self.position.spot_eth = max(0.0, self.position.spot_eth - size)
             self.position.last_sell_price = m.eth_price
             self.position.last_sell_size = size
+            # ghi nhận thời điểm SELL cho cooldown
+            self.strategy.last_sell_ts = time.time()
 
         elif action == "BUYBACK_SPOT_ETH":
             size = signal["size"]
@@ -789,7 +834,7 @@ class EthBot:
 # FastAPI App + Bot loop
 #############################
 
-app = FastAPI(title="ETH Strategy Bot – Bybit")
+app = FastAPI(title="ETH Strategy Bot – Bybit (BB + MA200 + Cooldown)")
 
 bot = EthBot()
 
