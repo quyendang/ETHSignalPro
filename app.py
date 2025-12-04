@@ -51,7 +51,7 @@ def pushover_notify(title: str, message: str):
         "title": title,
         "message": message,
         "priority": 0,
-        "sound": "cash",
+        "sound": "belll",
     }
     if PUSHOVER_DEVICE:
         data["device"] = PUSHOVER_DEVICE
