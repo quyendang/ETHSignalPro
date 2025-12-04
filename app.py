@@ -1,7 +1,5 @@
 import os
 import time
-import hmac
-import hashlib
 import threading
 from dataclasses import dataclass, asdict
 from math import isnan
@@ -16,8 +14,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # ENV & GLOBAL CONFIG
 #############################
 
-BINANCE_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
+INITIAL_SPOT_ETH = float(os.getenv("INITIAL_SPOT_ETH", "138"))
+AVG_ENTRY_ETH = float(os.getenv("AVG_ENTRY_ETH", "3150"))
 
 PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")
@@ -30,7 +28,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "eth_signals")
 
-TRAILING_PCT = float(os.getenv("TRAILING_PCT", "0.03"))  # 3% trailing
+TRAILING_PCT = float(os.getenv("TRAILING_PCT", "0.03"))  # 3%
 
 # In-memory state for dashboard
 RECENT_SIGNALS: List[Dict[str, Any]] = []
@@ -180,64 +178,95 @@ def qtile(values: List[float], q: float):
 
 
 #############################
-# Binance Client
+# Bybit Client (public REST v5)
 #############################
 
-class BinanceClient:
-    BASE_URL = "https://api.binance.com"
+class BybitClient:
+    BASE_URL = "https://api.bybit.com"
 
-    def _sign(self, query: str) -> str:
-        return hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-
-    def _get(self, path: str, params=None, signed=False):
+    def _get(self, path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         url = self.BASE_URL + path
-        headers = {"X-MBX-APIKEY": BINANCE_KEY} if BINANCE_KEY else {}
-        if params is None:
-            params = {}
-        if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            query = "&".join(f"{k}={v}" for k, v in params.items())
-            params["signature"] = self._sign(query)
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=10)
+            r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            if data.get("retCode") != 0:
+                print("[BYBIT ERROR]", data.get("retMsg"), data)
+                return None
+            return data
         except Exception as e:
-            print("[BINANCE ERROR]", e)
+            print("[BYBIT HTTP ERROR]", e)
             return None
 
     def get_ticker(self, symbol: str) -> Dict[str, float]:
-        r = self._get("/api/v3/ticker/price", {"symbol": symbol})
-        if not r:
+        """
+        Spot ticker: /v5/market/tickers?category=spot&symbol=ETHUSDT
+        """
+        data = self._get("/v5/market/tickers", {
+            "category": "spot",
+            "symbol": symbol,
+        })
+        if not data or "result" not in data or not data["result"].get("list"):
             return {"last": float("nan")}
-        return {"last": float(r["price"])}
+        last_str = data["result"]["list"][0]["lastPrice"]
+        return {"last": float(last_str)}
 
-    def get_ohlcv(self, symbol: str, interval: str, limit=500) -> List[Dict[str, Any]]:
-        r = self._get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-        if not r:
+    def _map_interval(self, interval: str) -> str:
+        """
+        Map internal interval ("4h", "1d") -> Bybit v5 interval.
+        """
+        mapping = {
+            "1m": "1",
+            "3m": "3",
+            "5m": "5",
+            "15m": "15",
+            "30m": "30",
+            "1h": "60",
+            "2h": "120",
+            "4h": "240",
+            "6h": "360",
+            "12h": "720",
+            "1d": "D",
+            "1D": "D",
+        }
+        return mapping.get(interval, interval)
+
+    def get_ohlcv(self, symbol: str, interval: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """
+        Spot kline: /v5/market/kline?category=spot&symbol=ETHUSDT&interval=240
+        Response list: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+        """
+        bybit_interval = self._map_interval(interval)
+        limit = min(limit, 200)
+        data = self._get("/v5/market/kline", {
+            "category": "spot",
+            "symbol": symbol,
+            "interval": bybit_interval,
+            "limit": limit,
+        })
+        if not data or "result" not in data or not data["result"].get("list"):
             return []
         candles = []
-        for c in r:
+        # list is sorted latest->oldest or oldest->latest? Doc: usually newest first
+        for item in reversed(data["result"]["list"]):
             candles.append({
-                "timestamp": c[0],
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-                "volume": float(c[5]),
+                "timestamp": int(item[0]),
+                "open": float(item[1]),
+                "high": float(item[2]),
+                "low": float(item[3]),
+                "close": float(item[4]),
+                "volume": float(item[5]),
             })
         return candles
 
     def get_balance(self, asset: str) -> float:
-        # Nếu bạn không muốn dùng private API thì có thể trả về 0 hoặc config tay.
-        if not BINANCE_KEY or not BINANCE_SECRET:
-            return 0.0
-        r = self._get("/api/v3/account", signed=True)
-        if not r:
-            return 0.0
-        for bal in r.get("balances", []):
-            if bal["asset"] == asset:
-                return float(bal["free"])
+        """
+        Ở bản Bybit này, để đơn giản và không cần API key,
+        ta không gọi balance thực, mà dùng INITIAL_SPOT_ETH từ ENV.
+        Hàm này chỉ giữ cho interface giống các phiên bản trước.
+        """
+        if asset == "ETH":
+            return INITIAL_SPOT_ETH
         return 0.0
 
 
@@ -276,7 +305,7 @@ class PositionState:
 #############################
 
 class HistoryProvider:
-    def __init__(self, client: BinanceClient):
+    def __init__(self, client: BybitClient):
         self.client = client
 
     def closes(self, symbol: str, interval: str, limit: int) -> List[float]:
@@ -308,7 +337,7 @@ class DynamicConfigBuilder:
         self.h = hist
 
     def build(self) -> Dict[str, Any]:
-        # RSI dynamic ETH/BTC
+        # RSI dynamic ETH/BTC (4H)
         eth_rsi_4h_series = self.h.rsi_series("ETHUSDT", "4h", 200)
         btc_rsi_4h_series = self.h.rsi_series("BTCUSDT", "4h", 200)
 
@@ -317,7 +346,7 @@ class DynamicConfigBuilder:
         btc_rsi_overbought = qtile(btc_rsi_4h_series, 0.8)
         btc_rsi_oversold = qtile(btc_rsi_4h_series, 0.2)
 
-        # BTC dump level (MA20 - 1.5*ATR)
+        # BTC dump level (MA20 - 1.5*ATR) trên 1D
         daily = self.h.client.get_ohlcv("BTCUSDT", "1d", 60)
         if not daily:
             btc_dump_level = 90000.0
@@ -332,19 +361,24 @@ class DynamicConfigBuilder:
                 atr14 = calc_atr(highs, lows, closes)
                 btc_dump_level = ma20 - 1.5 * atr14
 
-        # Buyback zone ETH (4h local range + fib)
+        # Buyback zone ETH trên 4H
         eth_4h = self.h.client.get_ohlcv("ETHUSDT", "4h", 120)
-        closes_4h = [c["close"] for c in eth_4h]
-        recent = closes_4h[-60:]
-        local_low = min(recent)
-        local_high = max(recent)
-        fib50 = local_low + 0.5 * (local_high - local_low)
-        fib618 = local_low + 0.618 * (local_high - local_low)
-        buyback_low = (local_low + fib50) / 2
-        buyback_high = fib618
+        closes_4h = [c["close"] for c in eth_4h] if eth_4h else []
+        if len(closes_4h) < 10:
+            buyback_low, buyback_high = 0, 0
+            sell_spot_eth_price_min = 0
+        else:
+            recent = closes_4h[-60:]
+            local_low = min(recent)
+            local_high = max(recent)
+            fib50 = local_low + 0.5 * (local_high - local_low)
+            fib618 = local_low + 0.618 * (local_high - local_low)
+            buyback_low = (local_low + fib50) / 2
+            buyback_high = fib618
+            sell_spot_eth_price_min = local_high - 0.2 * (local_high - local_low)
 
         # Volatility → max LTV
-        vol = realized_vol(closes_4h)
+        vol = realized_vol(closes_4h) if closes_4h else float("nan")
         if isnan(vol):
             max_ltv = 0.3
         elif vol < 0.02:
@@ -354,40 +388,40 @@ class DynamicConfigBuilder:
         else:
             max_ltv = 0.2
 
-        # ETHBTC breakdown & regime (4h + 1d)
+        # ETHBTC breakdown & regime (4H + 1D)
         ethbtc_4h = self.h.client.get_ohlcv("ETHBTC", "4h", 200)
-        ethbtc_closes = [c["close"] for c in ethbtc_4h]
-        ethbtc_highs = [c["high"] for c in ethbtc_4h]
-        ethbtc_lows = [c["low"] for c in ethbtc_4h]
+        ethbtc_closes = [c["close"] for c in ethbtc_4h] if ethbtc_4h else []
+        ethbtc_highs = [c["high"] for c in ethbtc_4h] if ethbtc_4h else []
+        ethbtc_lows = [c["low"] for c in ethbtc_4h] if ethbtc_4h else []
 
         if len(ethbtc_closes) >= 60:
             ma50 = sum(ethbtc_closes[-50:]) / 50
             atr_ethbtc = calc_atr(ethbtc_highs, ethbtc_lows, ethbtc_closes)
             ethbtc_breakdown = ma50 - 0.5 * atr_ethbtc
-        else:
+        elif ethbtc_closes:
             ethbtc_breakdown = ethbtc_closes[-1] * 0.97
+        else:
+            ethbtc_breakdown = 0.0
 
         # ETHBTC regime từ 1D
         ethbtc_1d = self.h.client.get_ohlcv("ETHBTC", "1d", 120)
-        ethbtc_daily_closes = [c["close"] for c in ethbtc_1d]
-        ethbtc_rsi_1d = calc_rsi(ethbtc_daily_closes) if ethbtc_daily_closes else float("nan")
-        if len(ethbtc_daily_closes) >= 200:
-            ma200 = sum(ethbtc_daily_closes[-200:]) / 200
-        else:
-            ma200 = ethbtc_daily_closes[-1] if ethbtc_daily_closes else float("nan")
-
-        if not isnan(ma200) and not isnan(ethbtc_rsi_1d):
-            if ethbtc_daily_closes[-1] > ma200 and ethbtc_rsi_1d > 50:
+        ethbtc_daily_closes = [c["close"] for c in ethbtc_1d] if ethbtc_1d else []
+        if ethbtc_daily_closes:
+            ethbtc_rsi_1d = calc_rsi(ethbtc_daily_closes)
+            if len(ethbtc_daily_closes) >= 200:
+                ma200 = sum(ethbtc_daily_closes[-200:]) / 200
+            else:
+                ma200 = ethbtc_daily_closes[-1]
+            last = ethbtc_daily_closes[-1]
+            if last > ma200 and ethbtc_rsi_1d > 50:
                 ethbtc_regime = "bull"
-            elif ethbtc_daily_closes[-1] < ma200 and ethbtc_rsi_1d < 50:
+            elif last < ma200 and ethbtc_rsi_1d < 50:
                 ethbtc_regime = "bear"
             else:
                 ethbtc_regime = "neutral"
         else:
+            ethbtc_rsi_1d = float("nan")
             ethbtc_regime = "neutral"
-
-        # Sell min price ~ gần đỉnh local
-        sell_spot_eth_price_min = local_high - 0.2 * (local_high - local_low)
 
         conf = {
             "eth_rsi_overbought_4h": eth_rsi_overbought,
@@ -400,6 +434,7 @@ class DynamicConfigBuilder:
             "ethbtc_breakdown": ethbtc_breakdown,
             "sell_spot_eth_price_min": sell_spot_eth_price_min,
             "ethbtc_regime": ethbtc_regime,
+            "ethbtc_rsi_1d": ethbtc_rsi_1d,
         }
         return conf
 
@@ -433,7 +468,7 @@ class EthStrategy:
             return None
         trigger_price = self.trailing_peak * (1 - TRAILING_PCT)
         if price <= trigger_price:
-            # tắt trailing sau khi trigger, SELL sẽ được đẩy ra ngoài
+            # tắt trailing sau khi trigger
             self.trailing_active = False
             peak = self.trailing_peak
             self.trailing_peak = None
@@ -445,21 +480,12 @@ class EthStrategy:
         return None
 
     def _maybe_start_trailing(self, price: float):
-        """
-        Gọi khi thấy điều kiện SELL phù hợp nhưng muốn trailing thay vì sell ngay.
-        """
         if not self.trailing_active:
             self.trailing_active = True
             self.trailing_peak = price
 
-    def should_sell_spot(self, m: MarketState, p: PositionState) -> Optional[Dict]:
-        """
-        SELL_SPOT_ETH:
-        - Có 2 chế độ:
-          1) Nếu trailing đang active và giá cắt xuống trail → SELL
-          2) Nếu chưa active, check điều kiện overbought + bad macro → start trailing (không SELL ngay)
-        """
-        # 1. Nếu đang trailing → check trigger
+    def should_sell_spot(self, m: "MarketState", p: "PositionState") -> Optional[Dict]:
+        # 1. Nếu đã bật trailing, check xem có trigger chưa
         trailing = self._update_trailing(m.eth_price)
         if trailing and trailing.get("triggered"):
             size = min(30.0, p.spot_eth * 0.3)
@@ -476,12 +502,12 @@ class EthStrategy:
             }
 
         # 2. Nếu chưa trailing, check điều kiện để bật trailing
-        min_price = self.conf["sell_spot_eth_price_min"]
-        if m.eth_price < min_price:
+        min_price = self.conf.get("sell_spot_eth_price_min", 0)
+        if m.eth_price < min_price or min_price <= 0:
             self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
             return None
 
-        # Nếu ETHBTC đang BULL regime → hạn chế sell swing
+        # Nếu ETHBTC đang bull regime → hạn chế swing sell
         if self.conf.get("ethbtc_regime") == "bull":
             self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
             return None
@@ -496,23 +522,29 @@ class EthStrategy:
                 and m.eth_macd_hist_4h < self.prev_eth_macd_hist_4h
             )
 
-        bad_ethbtc = m.ethbtc_price < self.conf["ethbtc_breakdown"]
+        bad_ethbtc = (
+            self.conf.get("ethbtc_breakdown", 0) > 0
+            and m.ethbtc_price < self.conf["ethbtc_breakdown"]
+        )
         bad_btc = m.btc_price < self.conf["btc_dump_level"]
 
         self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
 
         if (rsi_hot or macd_peak) and (bad_ethbtc or bad_btc):
-            # thay vì SELL ngay → bật trailing
+            # Thay vì sell ngay → bật trailing
             self._maybe_start_trailing(m.eth_price)
             return None
 
         return None
 
-    def should_buyback_spot(self, m: MarketState, p: PositionState) -> Optional[Dict]:
+    def should_buyback_spot(self, m: "MarketState", p: "PositionState") -> Optional[Dict]:
         if not p.last_sell_size or p.last_sell_size <= 0:
             return None
 
-        low, high = self.conf["buyback_zone"]
+        low, high = self.conf.get("buyback_zone", (0, 0))
+        if low <= 0 or high <= 0:
+            return None
+
         if not (low <= m.eth_price <= high):
             return None
 
@@ -533,29 +565,32 @@ class EthStrategy:
             },
         }
 
-    def max_safe_loan(self, m: MarketState, p: PositionState) -> float:
+    def max_safe_loan(self, m: "MarketState", p: "PositionState") -> float:
         if p.spot_eth <= 0:
             return 0.0
         collateral_value = p.spot_eth * m.eth_price
         if collateral_value <= 0:
             return 0.0
-        max_ltv = self.conf["max_ltv"]
+        max_ltv = self.conf.get("max_ltv", 0.3)
         current_ltv = p.loan_usdt / collateral_value if p.loan_usdt > 0 else 0.0
         room = max_ltv - current_ltv
         if room <= 0:
             return 0.0
         return collateral_value * room
 
-    def should_open_loan(self, m: MarketState, p: PositionState) -> Optional[Dict]:
-        low, high = self.conf["buyback_zone"]
-        # Mua khi giá <= vùng buyback_high
+    def should_open_loan(self, m: "MarketState", p: "PositionState") -> Optional[Dict]:
+        low, high = self.conf.get("buyback_zone", (0, 0))
+        if low <= 0 or high <= 0:
+            return None
+
+        # Chỉ vay-mua thêm khi ETH đang nằm vùng chiết khấu
         if m.eth_price > high:
             return None
-        # BTC không trong trạng thái dump mạnh
+
         if m.btc_price < self.conf["btc_dump_level"]:
             return None
-        # ETHBTC không gãy support
-        if m.ethbtc_price < self.conf["ethbtc_breakdown"]:
+
+        if self.conf.get("ethbtc_breakdown", 0) > 0 and m.ethbtc_price < self.conf["ethbtc_breakdown"]:
             return None
 
         loan_amount = self.max_safe_loan(m, p)
@@ -571,15 +606,17 @@ class EthStrategy:
                 "eth_price": m.eth_price,
                 "btc_price": m.btc_price,
                 "ethbtc_price": m.ethbtc_price,
-                "max_ltv": self.conf["max_ltv"],
+                "max_ltv": self.conf.get("max_ltv", 0.3),
             },
         }
 
-    def should_repay_loan(self, m: MarketState, p: PositionState) -> Optional[Dict]:
+    def should_repay_loan(self, m: "MarketState", p: "PositionState") -> Optional[Dict]:
         if p.loan_usdt <= 0:
             return None
 
-        low, high = self.conf["buyback_zone"]
+        low, high = self.conf.get("buyback_zone", (0, 0))
+        if high <= 0:
+            return None
         target_price = high * 1.10
         if m.eth_price < target_price:
             return None
@@ -609,27 +646,25 @@ class EthStrategy:
 
 class EthBot:
     def __init__(self):
-        self.client = BinanceClient()
+        self.client = BybitClient()
         self.hist = HistoryProvider(self.client)
         self.conf_builder = DynamicConfigBuilder(self.hist)
         self.conf = self.conf_builder.build()
         self.strategy = EthStrategy(self.conf)
 
-        # Bạn có thể set spot_eth theo thực tế nếu không dùng get_balance
         self.position = PositionState(
-            spot_eth=138.0,   # ví dụ bạn đang có 138 ETH
+            spot_eth=INITIAL_SPOT_ETH,
             loan_usdt=0.0,
-            avg_entry_eth=3150.0,
+            avg_entry_eth=AVG_ENTRY_ETH,
         )
 
         self.last_conf_update = 0
-        self.conf_update_interval = 4 * 60 * 60  # 4 giờ
+        self.conf_update_interval = 4 * 60 * 60  # 4h
 
     def update_position(self):
-        # Nếu muốn dùng balance thực:
-        bal = self.client.get_balance("ETH")
-        if bal > 0:
-            self.position.spot_eth = bal
+        # Bạn có thể đọc lại số ETH từ ENV, hoặc nếu muốn có Bybit API riêng
+        # cho balance thì thay thế chỗ này.
+        self.position.spot_eth = INITIAL_SPOT_ETH
 
     def build_market_state(self) -> MarketState:
         eth = self.client.get_ticker("ETHUSDT")["last"]
@@ -641,11 +676,11 @@ class EthBot:
         ethbtc4 = self.hist.closes("ETHBTC", "4h", 80)
         ethbtc1d = self.hist.closes("ETHBTC", "1d", 120)
 
-        eth_rsi_4h = calc_rsi(eth4)
-        btc_rsi_4h = calc_rsi(btc4)
+        eth_rsi_4h = calc_rsi(eth4) if eth4 else float("nan")
+        btc_rsi_4h = calc_rsi(btc4) if btc4 else float("nan")
 
-        _, _, eth_macd_hist_4h = calc_macd(eth4)
-        _, _, btc_macd_hist_4h = calc_macd(btc4)
+        _, _, eth_macd_hist_4h = calc_macd(eth4) if eth4 else (float("nan"),)*3
+        _, _, btc_macd_hist_4h = calc_macd(btc4) if btc4 else (float("nan"),)*3
 
         ethbtc_rsi_4h = calc_rsi(ethbtc4) if ethbtc4 else float("nan")
         ethbtc_rsi_1d = calc_rsi(ethbtc1d) if ethbtc1d else float("nan")
@@ -689,21 +724,24 @@ class EthBot:
         }
         print("[SIGNAL]", payload)
 
-        # Push into in-memory list for dashboard
         RECENT_SIGNALS.append(payload)
         if len(RECENT_SIGNALS) > MAX_SIGNALS:
             RECENT_SIGNALS = RECENT_SIGNALS[-MAX_SIGNALS:]
 
-        # Notify
         title = f"ETH SIGNAL: {action}"
-        msg = f"{action}\nETH: {m.eth_price:.2f}\nBTC: {m.btc_price:.2f}\nETHBTC: {m.ethbtc_price:.6f}\n\n{signal}"
+        msg = (
+            f"{action}\n"
+            f"ETH: {m.eth_price:.2f}\n"
+            f"BTC: {m.btc_price:.2f}\n"
+            f"ETHBTC: {m.ethbtc_price:.6f}\n\n"
+            f"{signal}"
+        )
         pushover_notify(title, msg)
         telegram_notify(msg)
 
-        # Log Supabase
         supabase_log_signal(action, m, payload)
 
-        # Update internal "virtual" position state
+        # Update “virtual” position
         if action == "SELL_SPOT_ETH":
             size = signal["size"]
             self.position.spot_eth = max(0.0, self.position.spot_eth - size)
@@ -719,14 +757,12 @@ class EthBot:
         elif action == "OPEN_LOAN_BUY_ETH":
             loan = signal["loan_amount"]
             self.position.loan_usdt += loan
-            # giả sử dùng loan để mua ETH spot:
             bought_eth = loan / m.eth_price
             self.position.spot_eth += bought_eth
 
         elif action == "REPAY_LOAN_SELL_ETH":
             size = signal["size"]
             self.position.spot_eth = max(0.0, self.position.spot_eth - size)
-            # giả sử bán ra thu về đủ USDT để trả hết loan
             self.position.loan_usdt = 0.0
 
     def run_step(self):
@@ -737,11 +773,6 @@ class EthBot:
         m = self.build_market_state()
         LAST_MARKET_STATE = asdict(m)
 
-        # Thứ tự ưu tiên:
-        # 1. REPAY loan
-        # 2. SELL spot (trailing)
-        # 3. BUYBACK spot
-        # 4. OPEN loan
         sig = self.strategy.should_repay_loan(m, self.position)
         if not sig:
             sig = self.strategy.should_sell_spot(m, self.position)
@@ -755,10 +786,10 @@ class EthBot:
 
 
 #############################
-# FastAPI App + Bot thread
+# FastAPI App + Bot loop
 #############################
 
-app = FastAPI(title="ETH Strategy Bot")
+app = FastAPI(title="ETH Strategy Bot – Bybit")
 
 bot = EthBot()
 
@@ -769,12 +800,11 @@ def bot_loop():
         except Exception as e:
             print("[BOT ERROR]", e)
             pushover_notify("ETH BOT ERROR", str(e))
-        time.sleep(60)  # mỗi phút chạy 1 step
+        time.sleep(60)  # mỗi phút chạy 1 lần
 
 
 @app.on_event("startup")
 def on_startup():
-    # start bot loop in background thread
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
     print("[BOT] Started background loop")
@@ -782,26 +812,30 @@ def on_startup():
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    # Simple HTML dashboard
     m = LAST_MARKET_STATE or {}
     c = LAST_CONFIG or {}
+
+    def fmt_float(val, digits=2):
+        return f"{val:.{digits}f}" if isinstance(val, (int, float)) and not isnan(val) else "N/A"
+
     html_signals = ""
     for s in reversed(RECENT_SIGNALS[-20:]):
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s["ts"]))
+        mk = s["market"]
         html_signals += f"""
         <tr>
           <td>{ts}</td>
           <td>{s['action']}</td>
-          <td>{s['market']['eth_price']:.2f}</td>
-          <td>{s['market']['btc_price']:.2f}</td>
-          <td>{s['market']['ethbtc_price']:.6f}</td>
+          <td>{fmt_float(mk.get('eth_price'), 2)}</td>
+          <td>{fmt_float(mk.get('btc_price'), 2)}</td>
+          <td>{fmt_float(mk.get('ethbtc_price'), 6)}</td>
         </tr>
         """
 
     html = f"""
     <html>
     <head>
-      <title>ETH Strategy Bot Dashboard</title>
+      <title>ETH Strategy Bot Dashboard (Bybit)</title>
       <style>
         body {{
           font-family: Arial, sans-serif;
@@ -831,20 +865,24 @@ def dashboard():
         th {{
           background: #20263f;
         }}
+        pre {{
+          white-space: pre-wrap;
+          font-size: 12px;
+        }}
       </style>
     </head>
     <body>
-      <h1>ETH Strategy Bot Dashboard</h1>
+      <h1>ETH Strategy Bot (Bybit)</h1>
 
       <div class="card">
         <h2>Market State</h2>
-        <p>ETH: {m.get('eth_price', 'N/A'):.2f} USDT</p>
-        <p>BTC: {m.get('btc_price', 'N/A'):.2f} USDT</p>
-        <p>ETHBTC: {m.get('ethbtc_price', 'N/A'):.6f}</p>
-        <p>ETH RSI 4H: {m.get('eth_rsi_4h', float("nan")):.2f}</p>
-        <p>BTC RSI 4H: {m.get('btc_rsi_4h', float("nan")):.2f}</p>
-        <p>ETHBTC RSI 4H: {m.get('ethbtc_rsi_4h', float("nan")):.2f}</p>
-        <p>ETHBTC RSI 1D: {m.get('ethbtc_rsi_1d', float("nan")):.2f}</p>
+        <p>ETH: {fmt_float(m.get('eth_price'), 2)} USDT</p>
+        <p>BTC: {fmt_float(m.get('btc_price'), 2)} USDT</p>
+        <p>ETHBTC: {fmt_float(m.get('ethbtc_price'), 6)}</p>
+        <p>ETH RSI 4H: {fmt_float(m.get('eth_rsi_4h'), 2)}</p>
+        <p>BTC RSI 4H: {fmt_float(m.get('btc_rsi_4h'), 2)}</p>
+        <p>ETHBTC RSI 4H: {fmt_float(m.get('ethbtc_rsi_4h'), 2)}</p>
+        <p>ETHBTC RSI 1D: {fmt_float(m.get('ethbtc_rsi_1d'), 2)}</p>
         <p>ETHBTC trend: {m.get('ethbtc_trend', 'N/A')}</p>
       </div>
 
