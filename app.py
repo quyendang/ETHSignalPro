@@ -51,7 +51,7 @@ def pushover_notify(title: str, message: str):
         "title": title,
         "message": message,
         "priority": 0,
-        "sound": "cash",
+        "sound": "belll",
     }
     if PUSHOVER_DEVICE:
         data["device"] = PUSHOVER_DEVICE
@@ -754,6 +754,7 @@ class EthBot:
             msg = f"Dynamic config updated: {self.conf}"
             print("[CONF]", msg)
             pushover_notify("ETH Bot – Config Updated", msg)
+            telegram_notify(msg)
 
     def handle_signal(self, signal: Dict[str, Any], m: MarketState):
         global RECENT_SIGNALS
