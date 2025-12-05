@@ -863,6 +863,29 @@ def dashboard():
             "price": s["market"].get("eth_price", 0)
         })
     
+    # Get historical price data for chart (even without signals)
+    price_history = []
+    try:
+        eth_4h = bot.client.get_ohlcv("ETHUSDT", "4h", 100)
+        if eth_4h and len(eth_4h) > 0:
+            for candle in eth_4h[-50:]:  # Last 50 candles
+                price_history.append({
+                    "time": candle["timestamp"],
+                    "price": candle["close"],
+                    "high": candle["high"],
+                    "low": candle["low"],
+                })
+    except Exception as e:
+        print(f"[DASHBOARD] Error fetching price history: {e}")
+        # Fallback: use current price if available
+        if m.get("eth_price"):
+            price_history.append({
+                "time": int(time.time()),
+                "price": m.get("eth_price"),
+                "high": m.get("eth_price"),
+                "low": m.get("eth_price"),
+            })
+    
     buy_zone = c.get("buy_zone", (0, 0))
     sell_zone = c.get("sell_zone", (0, 0))
     price_range = c.get("price_range", (0, 0))
@@ -1011,6 +1034,12 @@ def dashboard():
             
             <div class="card">
                 <h2>📡 Recent Signals</h2>
+                <div style="margin-bottom: 15px;">
+                    <button onclick="loadSignalsFromSupabase()" style="padding: 8px 16px; background: #3b82f6; color: white; border: none; border-radius: 5px; cursor: pointer; margin-right: 10px;">
+                        Load from Database
+                    </button>
+                    <span id="signalCount" style="color: #a0a0a0;">Showing {len(RECENT_SIGNALS)} signals</span>
+                </div>
                 <table>
                     <thead>
                         <tr>
@@ -1019,18 +1048,23 @@ def dashboard():
                             <th>ETH Price</th>
                             <th>RSI 4H</th>
                             <th>MACD Hist</th>
+                            <th>Details</th>
                         </tr>
                     </thead>
-                    <tbody>
+                    <tbody id="signalsTableBody">
                         {"".join([f"""
                         <tr>
                             <td>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['ts']))}</td>
-                            <td>{s['action']}</td>
+                            <td><strong style="color: {'#22c55e' if 'BUY' in s['action'] else '#ef4444' if 'SELL' in s['action'] else '#f59e0b'}">{s['action']}</strong></td>
                             <td>${fmt(s['market'].get('eth_price'), 2)}</td>
                             <td>{fmt(s['market'].get('eth_rsi_4h'), 2)}</td>
                             <td>{fmt(s['market'].get('eth_macd_hist'), 2)}</td>
+                            <td>
+                                {f"Loan: ${fmt(s['signal'].get('loan_amount', 0), 2)}" if 'loan_amount' in s.get('signal', {}) else ''}
+                                {f"ETH: {fmt(s['signal'].get('eth_amount', 0), 4)}" if 'eth_amount' in s.get('signal', {}) else ''}
+                            </td>
                         </tr>
-                        """ for s in reversed(RECENT_SIGNALS[-30:])]) or "<tr><td colspan='5'>No signals yet</td></tr>"}
+                        """ for s in reversed(RECENT_SIGNALS[-30:])]) or "<tr><td colspan='6'>No signals yet</td></tr>"}
                     </tbody>
                 </table>
             </div>
@@ -1059,57 +1093,282 @@ def dashboard():
         
         <script>
             const signalsData = {json.dumps(signals_data)};
+            const priceHistory = {json.dumps(price_history)};
             const buyZone = {json.dumps(buy_zone)};
             const sellZone = {json.dumps(sell_zone)};
             const priceRange = {json.dumps(price_range)};
             
-            if (signalsData && signalsData.length > 0) {{
-                const ctx = document.getElementById('priceChart').getContext('2d');
-                new Chart(ctx, {{
+            // Use price history if available, otherwise use signals
+            let chartData = priceHistory && priceHistory.length > 0 ? priceHistory : signalsData;
+            let chartLabels = [];
+            let chartPrices = [];
+            
+            if (chartData && chartData.length > 0) {{
+                chartLabels = chartData.map(d => new Date(d.time * 1000).toLocaleString());
+                chartPrices = chartData.map(d => d.price || d.close || 0);
+            }}
+            
+            // Prepare signal markers - separate datasets for each signal type
+            const buySignals = [];
+            const sellSignals = [];
+            const profitSignals = [];
+            
+            if (signalsData && signalsData.length > 0 && chartLabels.length > 0) {{
+                signalsData.forEach(signal => {{
+                    const signalTime = new Date(signal.time * 1000);
+                    // Find closest price point
+                    let closestIdx = 0;
+                    let minDiff = Infinity;
+                    chartLabels.forEach((label, idx) => {{
+                        const labelTime = new Date(label);
+                        const diff = Math.abs(signalTime - labelTime);
+                        if (diff < minDiff) {{
+                            minDiff = diff;
+                            closestIdx = idx;
+                        }}
+                    }});
+                    
+                    // Only add if within 4 hours
+                    if (minDiff < 1000 * 60 * 60 * 4) {{
+                        const signalPoint = {{
+                            x: closestIdx,
+                            y: signal.price,
+                            action: signal.action,
+                            time: signal.time
+                        }};
+                        
+                        if (signal.action === 'BUY_ETH_WITH_LOAN') {{
+                            buySignals.push(signalPoint);
+                        }} else if (signal.action === 'SELL_ETH_REPAY_LOAN') {{
+                            sellSignals.push(signalPoint);
+                        }} else if (signal.action === 'TAKE_PROFIT_SELL') {{
+                            profitSignals.push(signalPoint);
+                        }}
+                    }}
+                }});
+            }}
+            
+            const ctx = document.getElementById('priceChart');
+            if (ctx && chartData && chartData.length > 0) {{
+                const chartCtx = ctx.getContext('2d');
+                
+                const datasets = [{{
+                    label: 'ETH Price',
+                    data: chartPrices,
+                    borderColor: '#ffd166',
+                    backgroundColor: 'rgba(255,209,102,0.1)',
+                    borderWidth: 2,
+                    pointRadius: 2,
+                    pointHoverRadius: 5,
+                    fill: true,
+                }}];
+                
+                // Add signal markers as separate datasets for better visibility
+                if (buySignals.length > 0) {{
+                    const buyData = new Array(chartPrices.length).fill(null);
+                    buySignals.forEach(s => {{
+                        buyData[s.x] = s.y;
+                    }});
+                    datasets.push({{
+                        label: '🟢 Buy Signals',
+                        data: buyData,
+                        borderColor: '#22c55e',
+                        backgroundColor: '#22c55e',
+                        pointRadius: 8,
+                        pointHoverRadius: 10,
+                        pointStyle: 'circle',
+                        showLine: false,
+                    }});
+                }}
+                
+                if (sellSignals.length > 0) {{
+                    const sellData = new Array(chartPrices.length).fill(null);
+                    sellSignals.forEach(s => {{
+                        sellData[s.x] = s.y;
+                    }});
+                    datasets.push({{
+                        label: '🔴 Sell Signals',
+                        data: sellData,
+                        borderColor: '#ef4444',
+                        backgroundColor: '#ef4444',
+                        pointRadius: 8,
+                        pointHoverRadius: 10,
+                        pointStyle: 'circle',
+                        showLine: false,
+                    }});
+                }}
+                
+                if (profitSignals.length > 0) {{
+                    const profitData = new Array(chartPrices.length).fill(null);
+                    profitSignals.forEach(s => {{
+                        profitData[s.x] = s.y;
+                    }});
+                    datasets.push({{
+                        label: '🟡 Profit Signals',
+                        data: profitData,
+                        borderColor: '#f59e0b',
+                        backgroundColor: '#f59e0b',
+                        pointRadius: 8,
+                        pointHoverRadius: 10,
+                        pointStyle: 'circle',
+                        showLine: false,
+                    }});
+                }}
+                
+                // Add zone lines if zones are defined
+                if (buyZone && buyZone[0] > 0 && buyZone[1] > 0) {{
+                    datasets.push({{
+                        label: 'Buy Zone (High)',
+                        data: chartPrices.map(() => buyZone[1]),
+                        borderColor: '#22c55e',
+                        borderDash: [5, 5],
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: false,
+                    }});
+                    datasets.push({{
+                        label: 'Buy Zone (Low)',
+                        data: chartPrices.map(() => buyZone[0]),
+                        borderColor: '#22c55e',
+                        borderDash: [5, 5],
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: false,
+                    }});
+                }}
+                
+                if (sellZone && sellZone[0] > 0 && sellZone[1] > 0) {{
+                    datasets.push({{
+                        label: 'Sell Zone (High)',
+                        data: chartPrices.map(() => sellZone[1]),
+                        borderColor: '#ef4444',
+                        borderDash: [5, 5],
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: false,
+                    }});
+                    datasets.push({{
+                        label: 'Sell Zone (Low)',
+                        data: chartPrices.map(() => sellZone[0]),
+                        borderColor: '#ef4444',
+                        borderDash: [5, 5],
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: false,
+                    }});
+                }}
+                
+                new Chart(chartCtx, {{
                     type: 'line',
                     data: {{
-                        labels: signalsData.map(s => new Date(s.time * 1000).toLocaleString()),
-                        datasets: [{{
-                            label: 'ETH Price',
-                            data: signalsData.map(s => s.price),
-                            borderColor: '#ffd166',
-                            backgroundColor: 'rgba(255,209,102,0.1)',
-                            borderWidth: 2,
-                            pointRadius: 4,
-                            pointBackgroundColor: signalsData.map(s => {{
-                                const colors = {{
-                                    'BUY_ETH_WITH_LOAN': '#22c55e',
-                                    'SELL_ETH_REPAY_LOAN': '#ef4444',
-                                    'TAKE_PROFIT_SELL': '#f59e0b'
-                                }};
-                                return colors[s.action] || '#888';
-                            }}),
-                        }}, {{
-                            label: 'Buy Zone',
-                            data: signalsData.map(() => buyZone[1]),
-                            borderColor: '#22c55e',
-                            borderDash: [5, 5],
-                            borderWidth: 1,
-                            pointRadius: 0,
-                        }}, {{
-                            label: 'Sell Zone',
-                            data: signalsData.map(() => sellZone[0]),
-                            borderColor: '#ef4444',
-                            borderDash: [5, 5],
-                            borderWidth: 1,
-                            pointRadius: 0,
-                        }}]
+                        labels: chartLabels,
+                        datasets: datasets
                     }},
                     options: {{
                         responsive: true,
                         maintainAspectRatio: false,
-                        plugins: {{ legend: {{ labels: {{ color: '#f0f0f0' }} }} }},
+                        plugins: {{
+                            legend: {{
+                                labels: {{ color: '#f0f0f0' }},
+                                display: true,
+                                position: 'top'
+                            }},
+                            tooltip: {{
+                                mode: 'index',
+                                intersect: false,
+                                callbacks: {{
+                                    title: function(context) {{
+                                        return context[0].label;
+                                    }},
+                                    label: function(context) {{
+                                        const datasetLabel = context.dataset.label || '';
+                                        const value = context.parsed.y;
+                                        if (datasetLabel.includes('Signal')) {{
+                                            // Find signal details
+                                            const signalTime = new Date(chartLabels[context.dataIndex]);
+                                            const signal = signalsData.find(s => {{
+                                                const sTime = new Date(s.time * 1000);
+                                                return Math.abs(sTime - signalTime) < 1000 * 60 * 60;
+                                            }});
+                                            if (signal) {{
+                                                return `${{datasetLabel}}: ${{value.toFixed(2)}} | ${{signal.action}}`;
+                                            }}
+                                        }}
+                                        return `${{datasetLabel}}: ${{value.toFixed(2)}}`;
+                                    }}
+                                }}
+                            }}
+                        }},
                         scales: {{
-                            x: {{ ticks: {{ color: '#a0a0a0' }}, grid: {{ color: 'rgba(255,255,255,0.1)' }} }},
-                            y: {{ ticks: {{ color: '#a0a0a0' }}, grid: {{ color: 'rgba(255,255,255,0.1)' }} }}
+                            x: {{
+                                ticks: {{ color: '#a0a0a0', maxRotation: 45, minRotation: 45 }},
+                                grid: {{ color: 'rgba(255,255,255,0.1)' }}
+                            }},
+                            y: {{
+                                ticks: {{ color: '#a0a0a0' }},
+                                grid: {{ color: 'rgba(255,255,255,0.1)' }},
+                                title: {{
+                                    display: true,
+                                    text: 'Price (USDT)',
+                                    color: '#a0a0a0'
+                                }}
+                            }}
+                        }},
+                        interaction: {{
+                            mode: 'nearest',
+                            axis: 'x',
+                            intersect: false
                         }}
                     }}
                 }});
+            }} else {{
+                // Show message if no data
+                ctx.parentElement.innerHTML = '<p style="text-align: center; color: #888; padding: 40px;">Loading chart data... Please wait for bot to collect market data.</p>';
+            }}
+            
+            async function loadSignalsFromSupabase() {{
+                try {{
+                    const response = await fetch('/api/signals/supabase?limit=100');
+                    const data = await response.json();
+                    
+                    if (data.error) {{
+                        alert('Error: ' + data.error);
+                        return;
+                    }}
+                    
+                    const tbody = document.getElementById('signalsTableBody');
+                    if (data.signals && data.signals.length > 0) {{
+                        tbody.innerHTML = data.signals.map(s => {{
+                            const date = new Date(s.timestamp * 1000);
+                            const actionColor = s.action.includes('BUY') ? '#22c55e' : s.action.includes('SELL') ? '#ef4444' : '#f59e0b';
+                            const signalData = s.signal_data || {{}};
+                            const loanAmt = signalData.loan_amount ? parseFloat(signalData.loan_amount) : null;
+                            const ethAmt = signalData.eth_amount ? parseFloat(signalData.eth_amount) : null;
+                            const details = loanAmt ? `Loan: $` + loanAmt.toFixed(2) : 
+                                          ethAmt ? `ETH: ` + ethAmt.toFixed(4) : '';
+                            const ethPrice = parseFloat(s.eth_price || 0);
+                            const rsi4h = signalData.reason && signalData.reason.eth_rsi_4h ? parseFloat(signalData.reason.eth_rsi_4h).toFixed(2) : 'N/A';
+                            const macdHist = signalData.reason && signalData.reason.eth_macd_hist ? parseFloat(signalData.reason.eth_macd_hist).toFixed(2) : 'N/A';
+                            
+                            return `
+                                <tr>
+                                    <td>${{date.toLocaleString()}}</td>
+                                    <td><strong style="color: ${{actionColor}}">${{s.action}}</strong></td>
+                                    <td>$` + ethPrice.toFixed(2) + `</td>
+                                    <td>` + rsi4h + `</td>
+                                    <td>` + macdHist + `</td>
+                                    <td>` + details + `</td>
+                                </tr>
+                            `;
+                        }}).join('');
+                        
+                        document.getElementById('signalCount').textContent = `Showing ${{data.total}} signals from database`;
+                    }} else {{
+                        tbody.innerHTML = '<tr><td colspan="6">No signals in database</td></tr>';
+                    }}
+                }} catch (error) {{
+                    alert('Error loading signals: ' + error.message);
+                }}
             }}
             
             async function runBacktest() {{
@@ -1191,4 +1450,40 @@ def api_state():
         "position": asdict(bot.position),
         "recent_signals": RECENT_SIGNALS[-50:],
     })
+
+@app.get("/api/signals", response_class=JSONResponse)
+def api_signals(limit: int = 100):
+    """Get signals from memory (recent)"""
+    return sanitize_for_json({
+        "signals": RECENT_SIGNALS[-limit:],
+        "total": len(RECENT_SIGNALS),
+    })
+
+@app.get("/api/signals/supabase", response_class=JSONResponse)
+def api_signals_supabase(limit: int = 100):
+    """Get signals from Supabase database"""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return JSONResponse(content={"error": "Supabase not configured"}, status_code=400)
+    
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    params = {
+        "order": "timestamp.desc",
+        "limit": limit,
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return sanitize_for_json({
+            "signals": data,
+            "total": len(data),
+        })
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
