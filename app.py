@@ -625,94 +625,48 @@ class EthStrategy:
             }
 
         # 2. Nếu chưa trailing, check điều kiện để bật trailing
-        # Nới lỏng: Chỉ cảnh báo khi giá quá thấp, không block hoàn toàn
         min_price = self.conf.get("sell_spot_eth_price_min", 0.0)
-        if min_price > 0 and m.eth_price < min_price * 0.90:  # Chỉ block khi giá < 90% min_price
+        if m.eth_price < min_price or min_price <= 0:
             self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
             return None
 
-        # Nới lỏng: Chỉ cảnh báo khi ETHBTC bull, không block hoàn toàn
-        ethbtc_bull_penalty = 1.0
+        # Filter: ETHBTC bull regime → hạn chế swing SELL
         if self.conf.get("ethbtc_regime") == "bull":
-            ethbtc_bull_penalty = 0.7  # Giảm xác suất nhưng không block
+            self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
+            return None
 
-        # Nới lỏng Bollinger: Cho phép bật trailing khi giá gần upper band (trong 2% của upper)
+        # Điều kiện Bollinger: ưu tiên chỉ bật trailing khi giá chạm near upper band
         bb_upper = self.conf.get("eth_bb_upper_4h", float("nan"))
-        bb_condition_met = True
-        if not isnan(bb_upper):
-            # Cho phép khi giá >= 98% của upper band (thay vì phải >= 100%)
-            bb_condition_met = m.eth_price >= bb_upper * 0.98
+        if not isnan(bb_upper) and m.eth_price < bb_upper:
+            self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
+            return None
 
-        # Nới lỏng RSI: Giảm threshold xuống 5% (từ quantile 80% xuống 75%)
-        rsi_threshold = self.conf.get("eth_rsi_overbought_4h", float("nan"))
-        if not isnan(rsi_threshold):
-            rsi_threshold = rsi_threshold * 0.95  # Giảm 5%
-        
         rsi_hot = (
             not isnan(m.eth_rsi_4h)
-            and not isnan(rsi_threshold)
-            and m.eth_rsi_4h >= rsi_threshold
+            and not isnan(self.conf.get("eth_rsi_overbought_4h", float("nan")))
+            and m.eth_rsi_4h >= self.conf["eth_rsi_overbought_4h"]
         )
 
-        # Nới lỏng MACD: Chấp nhận khi MACD đang giảm (không cần cả hai điều kiện dương)
         macd_peak = False
         if self.prev_eth_macd_hist_4h is not None and not isnan(m.eth_macd_hist_4h):
-            # Chấp nhận khi MACD đang giảm từ mức cao
             macd_peak = (
-                m.eth_macd_hist_4h < self.prev_eth_macd_hist_4h
-                and (m.eth_macd_hist_4h > 0 or self.prev_eth_macd_hist_4h > 0)
+                self.prev_eth_macd_hist_4h > 0
+                and m.eth_macd_hist_4h > 0
+                and m.eth_macd_hist_4h < self.prev_eth_macd_hist_4h
             )
 
-        # Nới lỏng điều kiện bad: Chấp nhận khi một trong hai điều kiện thỏa (không cần cả hai)
         bad_ethbtc = (
             self.conf.get("ethbtc_breakdown", 0) > 0
-            and m.ethbtc_price < self.conf["ethbtc_breakdown"] * 1.02  # Nới lỏng 2%
+            and m.ethbtc_price < self.conf["ethbtc_breakdown"]
         )
-        bad_btc = m.btc_price < self.conf["btc_dump_level"] * 1.05  # Nới lỏng 5%
+        bad_btc = m.btc_price < self.conf["btc_dump_level"]
 
         self.prev_eth_macd_hist_4h = m.eth_macd_hist_4h
 
-        # Nới lỏng: Chỉ cần (RSI hot HOẶC MACD peak) VÀ (bad_ethbtc HOẶC bad_btc HOẶC bb_condition_met)
-        # Và áp dụng penalty cho ETHBTC bull (giảm threshold khi bull)
-        if (rsi_hot or macd_peak) and (bad_ethbtc or bad_btc or bb_condition_met):
-            # Khi ETHBTC bull, cần điều kiện mạnh hơn (RSI cao hơn hoặc MACD rõ ràng hơn)
-            if ethbtc_bull_penalty < 1.0:
-                # Cần cả RSI hot VÀ MACD peak khi ETHBTC bull
-                if rsi_hot and macd_peak:
-                    self._maybe_start_trailing(m.eth_price)
-            else:
-                # Bình thường: chỉ cần một trong hai
-                self._maybe_start_trailing(m.eth_price)
+        if (rsi_hot or macd_peak) and (bad_ethbtc or bad_btc):
+            # Điều kiện đủ kém → bật trailing (chưa SELL ngay)
+            self._maybe_start_trailing(m.eth_price)
             return None
-
-        # Nới lỏng thêm: Nếu RSI rất cao (>80) hoặc giá vượt quá BB upper nhiều (>5%), SELL trực tiếp
-        very_high_rsi = (
-            not isnan(m.eth_rsi_4h)
-            and m.eth_rsi_4h >= 80
-        )
-        price_way_above_bb = False
-        if not isnan(bb_upper):
-            price_way_above_bb = m.eth_price >= bb_upper * 1.05
-        
-        # Check cooldown
-        now = time.time()
-        cooldown_ok = (now - self.last_sell_ts) >= self.cooldown_secs
-        
-        if (very_high_rsi or price_way_above_bb) and cooldown_ok:
-            size = min(30.0, p.spot_eth * 0.3)
-            if size > 0:
-                return {
-                    "action": "SELL_SPOT_ETH",
-                    "size": round(size, 4),
-                    "mode": "direct_high_rsi_or_bb",
-                    "reason": {
-                        "eth_price": m.eth_price,
-                        "eth_rsi_4h": m.eth_rsi_4h,
-                        "bb_upper": bb_upper,
-                        "very_high_rsi": very_high_rsi,
-                        "price_way_above_bb": price_way_above_bb,
-                    },
-                }
 
         return None
 
@@ -724,44 +678,31 @@ class EthStrategy:
         if low <= 0 or high <= 0:
             return None
 
-        # Nới lỏng: Cho phép buyback trong vùng mở rộng (thêm 5% mỗi bên)
-        expanded_low = low * 0.95
-        expanded_high = high * 1.05
-        if not (expanded_low <= m.eth_price <= expanded_high):
+        if not (low <= m.eth_price <= high):
             return None
 
-        # Nới lỏng: Chỉ block khi BTC dump quá mạnh (>10% dưới dump level)
-        if m.btc_price < self.conf["btc_dump_level"] * 0.90:
+        if m.btc_price < self.conf["btc_dump_level"] * 0.95:
             return None
 
-        # Nới lỏng RSI: Cho phép buyback khi RSI không quá cao (tăng threshold 10%)
-        rsi_threshold = self.conf.get("eth_rsi_overbought_4h", float("nan"))
-        if not isnan(rsi_threshold):
-            if m.eth_rsi_4h > rsi_threshold * 1.10:  # Cho phép RSI cao hơn 10%
+        if not isnan(self.conf.get("eth_rsi_overbought_4h", float("nan"))):
+            if m.eth_rsi_4h > self.conf["eth_rsi_overbought_4h"]:
                 return None
 
-        # Nới lỏng: Không bắt buộc phải chạm lower BB, chỉ ưu tiên
-        # Nếu giá gần lower BB (trong 5%) thì ưu tiên hơn
+        # Ưu tiên buyback gần lower BB
         bb_lower = self.conf.get("eth_bb_lower_4h", float("nan"))
-        if not isnan(bb_lower):
-            if m.eth_price > bb_lower * 1.05:  # Nếu giá > 5% trên lower BB
-                # Vẫn cho phép nhưng có thể giảm size
-                size_multiplier = 0.8  # Giảm 20% size
-            else:
-                size_multiplier = 1.0
-        else:
-            size_multiplier = 1.0
+        if not isnan(bb_lower) and m.eth_price > bb_lower:
+            # giá chưa về tới lower band => có thể bỏ qua buyback lần này
+            return None
 
         return {
             "action": "BUYBACK_SPOT_ETH",
-            "size": round(p.last_sell_size * size_multiplier, 4),
+            "size": round(p.last_sell_size, 4),
             "reason": {
                 "eth_price": m.eth_price,
                 "buyback_zone": (low, high),
                 "btc_price": m.btc_price,
                 "eth_rsi_4h": m.eth_rsi_4h,
                 "bb_lower_4h": bb_lower,
-                "size_multiplier": size_multiplier,
             },
         }
 
@@ -783,42 +724,26 @@ class EthStrategy:
         if low <= 0 or high <= 0:
             return None
 
-        # Nới lỏng MA200: Chỉ cảnh báo, không block hoàn toàn
-        # Nếu giá < MA200, giảm loan amount thay vì block
+        # Filter: chỉ vay khi ETH trên MA200 1D
         ma200 = self.conf.get("eth_ma200_1d", 0.0)
-        ma200_penalty = 1.0
         if ma200 > 0 and m.eth_price < ma200:
-            # Nếu giá < MA200 nhưng > 90% MA200, vẫn cho phép nhưng giảm 50%
-            if m.eth_price >= ma200 * 0.90:
-                ma200_penalty = 0.5
-            else:
-                # Nếu giá < 90% MA200, vẫn cho phép nhưng giảm nhiều hơn (30%)
-                ma200_penalty = 0.3
-
-        # Nới lỏng: Cho phép vay khi giá trong vùng mở rộng (thêm 20% trên high)
-        if m.eth_price > high * 1.20:
             return None
 
-        # Nới lỏng BTC dump: Chỉ block khi dump quá mạnh (>10% dưới dump level)
-        if m.btc_price < self.conf["btc_dump_level"] * 0.90:
+        # Chỉ vay-mua thêm khi ETH đang trong/ dưới vùng chiết khấu
+        if m.eth_price > high:
             return None
 
-        # Nới lỏng ETHBTC breakdown: Cho phép khi giá gần breakdown (trong 5%)
-        ethbtc_breakdown = self.conf.get("ethbtc_breakdown", 0)
-        if ethbtc_breakdown > 0 and m.ethbtc_price < ethbtc_breakdown * 0.95:
+        if m.btc_price < self.conf["btc_dump_level"]:
+            return None
+
+        if self.conf.get("ethbtc_breakdown", 0) > 0 and m.ethbtc_price < self.conf["ethbtc_breakdown"]:
             return None
 
         loan_amount = self.max_safe_loan(m, p)
         if loan_amount <= 0:
             return None
 
-        # Áp dụng penalty cho MA200
-        loan_amount = loan_amount * ma200_penalty
         loan_amount = min(loan_amount, 50_000.0)
-        
-        # Đảm bảo loan amount tối thiểu
-        if loan_amount < 1000:
-            return None
 
         return {
             "action": "OPEN_LOAN_BUY_ETH",
@@ -829,7 +754,6 @@ class EthStrategy:
                 "ethbtc_price": m.ethbtc_price,
                 "max_ltv": self.conf.get("max_ltv", 0.3),
                 "eth_ma200_1d": ma200,
-                "ma200_penalty": ma200_penalty,
             },
         }
 
@@ -840,16 +764,12 @@ class EthStrategy:
         low, high = self.conf.get("buyback_zone", (0, 0))
         if high <= 0:
             return None
-        
-        # Nới lỏng: Giảm target price từ 10% xuống 7% trên buyback high
-        target_price = high * 1.07
+        target_price = high * 1.10
         if m.eth_price < target_price:
             return None
 
-        # Nới lỏng RSI: Cho phép repay khi RSI gần overbought (giảm 5%)
-        rsi_threshold = self.conf.get("eth_rsi_overbought_4h", float("nan"))
-        if not isnan(rsi_threshold):
-            if m.eth_rsi_4h < rsi_threshold * 0.95:
+        if not isnan(self.conf.get("eth_rsi_overbought_4h", float("nan"))):
+            if m.eth_rsi_4h < self.conf["eth_rsi_overbought_4h"]:
                 return None
 
         buffer = 1.01
@@ -1044,35 +964,19 @@ class Backtester:
             if not signal:
                 signal = strategy.should_open_loan(market_state, position)
             
-            # Debug: Log why no signal với chi tiết từng điều kiện
+            # Debug: Log why no signal (only for first few candles and periodically)
             if not signal and (i < 110 or i % 50 == 0):
-                # Check từng signal function để xem tại sao không có signal
-                debug_reasons = []
-                
-                # Check SELL_SPOT_ETH
-                min_price = strategy.conf.get("sell_spot_eth_price_min", 0.0)
-                sell_blocked_by_price = min_price > 0 and market_state.eth_price < min_price * 0.90
-                debug_reasons.append(f"SELL: price_blocked={sell_blocked_by_price}, min_price={min_price}")
-                
-                # Check BUYBACK_SPOT_ETH
-                buyback_blocked = not position.last_sell_size or position.last_sell_size <= 0
-                debug_reasons.append(f"BUYBACK: no_last_sell={buyback_blocked}")
-                
-                # Check OPEN_LOAN_BUY_ETH
-                buyback_zone = strategy.conf.get("buyback_zone", (0, 0))
-                open_loan_blocked = buyback_zone[0] <= 0 or market_state.eth_price > buyback_zone[1] * 1.10
-                debug_reasons.append(f"OPEN_LOAN: zone_blocked={open_loan_blocked}, zone={buyback_zone}")
-                
-                # Check REPAY_LOAN_SELL_ETH
-                repay_blocked = position.loan_usdt <= 0
-                debug_reasons.append(f"REPAY: no_loan={repay_blocked}, loan={position.loan_usdt}")
-                
                 debug_info = {
                     "candle": i,
                     "eth_price": market_state.eth_price,
                     "eth_rsi_4h": market_state.eth_rsi_4h,
                     "eth_macd_hist_4h": market_state.eth_macd_hist_4h,
-                    "reasons": debug_reasons,
+                    "btc_price": market_state.btc_price,
+                    "ethbtc_price": market_state.ethbtc_price,
+                    "ethbtc_trend": market_state.ethbtc_trend,
+                    "position_eth": position.spot_eth,
+                    "loan_usdt": position.loan_usdt,
+                    "last_sell_size": position.last_sell_size,
                 }
                 print(f"[BACKTEST DEBUG] No signal at candle {i}: {debug_info}")
             
@@ -2072,4 +1976,3 @@ def api_backtest(start: str, end: str):
     except Exception as e:
         print(f"[BACKTEST ERROR]", e)
         return JSONResponse(content={"error": str(e)}, status_code=500)
-
