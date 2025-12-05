@@ -66,13 +66,16 @@ def telegram_notify(message: str):
         print("[TELEGRAM] Missing credentials")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    headers = {
+        "Content-Type": "application/json"
+    }
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, data=data, timeout=10)
+        requests.post(url, json=data, headers=headers, timeout=10)
     except Exception as e:
         print("[TELEGRAM ERROR]", e)
 
