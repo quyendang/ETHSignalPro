@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass, asdict
 from math import isnan
 from typing import List, Dict, Any, Optional
-
+import math  # thêm dòng này
 import requests
 import numpy as np
 from fastapi import FastAPI
@@ -835,6 +835,24 @@ class EthBot:
 # FastAPI App + Bot loop
 #############################
 
+def sanitize_for_json(obj):
+    """
+    Đệ quy: thay NaN / +inf / -inf bằng None để JSONResponse không lỗi.
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    # các kiểu khác (str, int, bool, None, ...) giữ nguyên
+    return obj
+
+
+
+
 app = FastAPI(title="ETH Strategy Bot – Bybit (BB + MA200 + Cooldown)")
 
 bot = EthBot()
@@ -958,8 +976,11 @@ def dashboard():
 
 @app.get("/api/state", response_class=JSONResponse)
 def api_state():
-    return {
+    raw = {
         "market": LAST_MARKET_STATE,
         "config": LAST_CONFIG,
         "recent_signals": RECENT_SIGNALS[-50:],
     }
+    safe = sanitize_for_json(raw)
+    return safe
+
