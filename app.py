@@ -757,7 +757,12 @@ class EthBot:
             msg = f"Dynamic config updated: {self.conf}"
             print("[CONF]", msg)
             pushover_notify("ETH Bot – Config Updated", msg)
-            telegram_notify(msg)
+            telegram_msg = (
+                f"ETH Bot – Config Updated\n"
+                f"BUYBACK ZONES: {self.conf.buyback_zone}\n"
+                f"ETHBTC breakdown: {self.conf.ethbtc_breakdown}"
+            )
+            telegram_notify(telegram_msg)
 
     def handle_signal(self, signal: Dict[str, Any], m: MarketState):
         global RECENT_SIGNALS
