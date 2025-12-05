@@ -759,8 +759,6 @@ class EthBot:
             pushover_notify("ETH Bot – Config Updated", msg)
             telegram_msg = (
                 f"ETH Bot – Config Updated\n"
-                f"BUYBACK ZONES: {self.conf.buyback_zone}\n"
-                f"ETHBTC breakdown: {self.conf.ethbtc_breakdown}"
             )
             telegram_notify(telegram_msg)
 
