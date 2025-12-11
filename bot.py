@@ -2478,6 +2478,86 @@ def dashboard():
     """
     return html
 
+
+@app.get("/ohlcv", response_class=JSONResponse)
+def api_ohlcv():
+    """
+    Trả về OHLCV + indicator cho:
+    - ETHUSDT 4h, 1d
+    - BTCUSDT 4h, 1d
+    - ETHBTC 4h, 1d
+    """
+    client = bot.client  # BinanceClient trong EthRotationBot
+    symbols = ["ETHUSDT", "BTCUSDT", "ETHBTC"]
+    timeframes = ["4h", "1d"]
+    
+    result: Dict[str, Any] = {}
+    
+    for sym in symbols:
+        sym_key = sym.lower()
+        result[sym_key] = {}
+        
+        for tf in timeframes:
+            try:
+                candles = client.get_ohlcv(sym, tf, limit=300)
+            except Exception as e:
+                print(f"[OHLCV] Error fetching {sym} {tf}: {e}")
+                candles = []
+            
+            closes = [c["close"] for c in candles] if candles else []
+            latest_candle = candles[-1] if candles else None
+            
+            # Default indicator values
+            ema34_val = float("nan")
+            ema89_val = float("nan")
+            ema200_val = float("nan")
+            rsi14_val = float("nan")
+            macd_val = float("nan")
+            macd_signal_val = float("nan")
+            macd_hist_val = float("nan")
+            
+            if closes:
+                arr = np.array(closes, dtype=float)
+                # EMA
+                ema34 = calc_ema(arr, 34)
+                ema89 = calc_ema(arr, 89)
+                ema200 = calc_ema(arr, 200)
+                if len(ema34) > 0:
+                    ema34_val = float(ema34[-1])
+                if len(ema89) > 0:
+                    ema89_val = float(ema89[-1])
+                if len(ema200) > 0:
+                    ema200_val = float(ema200[-1])
+                
+                # RSI
+                rsi14_val = calc_rsi(closes)
+                
+                # MACD (dùng hàm sẵn có)
+                macd_val, macd_signal_val, macd_hist_val = calc_macd(closes)
+            
+            result[sym_key][tf] = {
+                "candles": candles,  # list [{timestamp, open, high, low, close, volume}, ...]
+                "latest": {
+                    "timestamp": latest_candle["timestamp"] if latest_candle else None,
+                    "open": latest_candle["open"] if latest_candle else None,
+                    "high": latest_candle["high"] if latest_candle else None,
+                    "low": latest_candle["low"] if latest_candle else None,
+                    "close": latest_candle["close"] if latest_candle else None,
+                    "volume": latest_candle["volume"] if latest_candle else None,
+                    "ema34": ema34_val,
+                    "ema89": ema89_val,
+                    "ema200": ema200_val,
+                    "rsi14": rsi14_val,
+                    "macd": macd_val,
+                    "macd_signal": macd_signal_val,
+                    "macd_hist": macd_hist_val,
+                },
+            }
+    
+    # Dùng sanitize_for_json để tránh NaN
+    return sanitize_for_json(result)
+
+
 @app.get("/api/backtest", response_class=JSONResponse)
 def api_backtest(start: str, end: str, realtime: bool = False, update_candles: int = 24):
     try:
