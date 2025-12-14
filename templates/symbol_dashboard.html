@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>{{ symbol }} Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --text-main: #0f172a;
+      --text-sub: #64748b;
+      --accent: #2563eb;
+      --green: #22c55e;
+      --red: #ef4444;
+      --muted: #e5e7eb;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+        "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text-main);
+    }
+
+    .page {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+    }
+
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .header-title {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .badge-symbol {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(37, 99, 235, 0.08);
+      color: var(--accent);
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    .badge-state {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-left: 8px;
+    }
+
+    .state-buy  { background-color: var(--green); color: #ffffff; }
+    .state-sell { background-color: var(--red);   color: #ffffff; }
+    .state-hold { background-color: #6b7280;     color: #ffffff; }
+
+    .header-sub {
+      font-size: 0.9rem;
+      color: var(--text-sub);
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border-radius: 14px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      box-shadow: 0 4px 10px rgba(15, 23, 42, 0.04);
+    }
+
+    .card-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-sub);
+      margin-bottom: 4px;
+    }
+
+    .card-main {
+      font-size: 1.1rem;
+      font-weight: 600;
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+    }
+
+    .card-sub {
+      font-size: 0.82rem;
+      color: var(--text-sub);
+      margin-top: 2px;
+    }
+
+    .change-badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: #ffffff;
+    }
+
+    .change-pos { background-color: var(--green); }
+    .change-neg { background-color: var(--red); }
+
+    .panel {
+      background: var(--card-bg);
+      border-radius: 16px;
+      padding: 16px 16px 20px;
+      border: 1px solid var(--border);
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+    }
+
+    .panel-title {
+      font-size: 0.96rem;
+      font-weight: 600;
+      margin-bottom: 10px;
+      color: var(--text-main);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .panel-title span.sub {
+      font-size: 0.8rem;
+      color: var(--text-sub);
+      font-weight: 400;
+    }
+
+    canvas { max-width: 100%; }
+
+    .zone-legend {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.8rem;
+      color: var(--text-sub);
+    }
+
+    .legend-box {
+      width: 14px;
+      height: 8px;
+      border-radius: 999px;
+    }
+
+    .legend-buy  { background: rgba(34, 197, 94, 0.12); }
+    .legend-sell { background: rgba(239, 68, 68, 0.12); }
+
+    .sub-btn {
+      border: none;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 999px;
+    }
+
+    @media (max-width: 640px) {
+      .header { align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <!-- HEADER -->
+    <header class="header">
+      <div>
+        <div class="header-title">
+          {{ symbol }} Dashboard
+          <span class="badge-symbol">
+            <span style="width:8px;height:8px;border-radius:999px;background:#22c55e;"></span>
+            Spot Tracker
+          </span>
+          <span id="lastStateBadge" class="badge-state state-hold">HOLD</span>
+        </div>
+        <div class="header-sub">
+          Auto-tracking Price, RSI, zones & BUY/SELL signals (4H data)
+          <br />
+          <small>
+            Server tracker:
+            <strong>{{ tracker_action }}</strong>
+            {% if tracker_reason %}
+              – {{ tracker_reason }}
+            {% endif %}
+          </small>
+        </div>
+      </div>
+
+      <div>
+        {% if is_subscribed %}
+        <form method="post" action="/bots/unsubscribe">
+          <input type="hidden" name="symbol" value="{{ symbol }}">
+          <button type="submit" class="sub-btn state-sell">UNSUBSCRIBE</button>
+        </form>
+        {% else %}
+        <form method="post" action="/bots/subscribe">
+          <input type="hidden" name="symbol" value="{{ symbol }}">
+          <button type="submit" class="sub-btn state-buy">SUBSCRIBE</button>
+        </form>
+        {% endif %}
+      </div>
+    </header>
+
+    <!-- SUMMARY CARDS -->
+    <section class="cards">
+      <div class="card">
+        <div class="card-label">Current Price</div>
+        <div class="card-main">
+          <span>${{ "%.2f"|format(last_price) if last_price is not none else "…" }}</span>
+          {% if change_24h is not none %}
+          {% set change_cls = "change-pos" if change_24h >= 0 else "change-neg" %}
+          <span class="change-badge {{ change_cls }}">
+            {{ "%+.2f"|format(change_24h) }}%
+          </span>
+          {% endif %}
+        </div>
+        <div class="card-sub">Last candle close (4H)</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">RSI H4</div>
+        <div class="card-main">
+          <span>{{ "%.2f"|format(last_rsi) if last_rsi is not none else "…" }}</span>
+        </div>
+        <div class="card-sub">Momentum oscillator (0–100)</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Buy Zone</div>
+        <div class="card-main">
+          {% if buy_low is not none and buy_high is not none %}
+          <span>${{ "%.0f"|format(buy_low) }} – {{ "%.0f"|format(buy_high) }}</span>
+          {% else %}
+          <span>Auto-calculating…</span>
+          {% endif %}
+        </div>
+        <div class="card-sub">Only BUY signals inside this zone</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Sell Zone</div>
+        <div class="card-main">
+          {% if sell_low is not none and sell_high is not none %}
+          <span>${{ "%.0f"|format(sell_low) }} – {{ "%.0f"|format(sell_high) }}</span>
+          {% else %}
+          <span>Auto-calculating…</span>
+          {% endif %}
+        </div>
+        <div class="card-sub">Only SELL signals inside this zone</div>
+      </div>
+    </section>
+
+    <!-- MAIN CHART -->
+    <section class="panel">
+      <div class="panel-title">
+        <div>
+          Giá {{ symbol }} (Price + RSI + Buy/Sell signals)
+          <span class="sub">4H candles</span>
+        </div>
+        <div class="zone-legend">
+          <span class="legend-box legend-buy"></span> Buy zone
+          <span class="legend-box legend-sell"></span> Sell zone
+        </div>
+      </div>
+      <canvas id="priceRsiChart" height="260"></canvas>
+    </section>
+  </div>
+
+  <!-- ================= SCRIPT ================= -->
+  <script>
+    // ==== 1. Dữ liệu từ backend ====
+    const rows = {{ rows_json | tojson }};
+    const symbol = "{{ symbol }}";
+
+    const labels    = rows.map(r => r.time_str);
+    const prices    = rows.map(r => r.price);
+    const rsiValues = rows.map(r => r.rsi_h4);
+
+    const emaFast   = rows.map(r => r.ema_fast);
+    const emaSlow   = rows.map(r => r.ema_slow);
+    const bbUpper   = rows.map(r => r.bb_upper);
+    const bbLower   = rows.map(r => r.bb_lower);
+    const stochK    = rows.map(r => r.stoch_k);
+    const wrValues  = rows.map(r => r.wr);
+
+    const buyLow  = {{ buy_low  if buy_low  is not none else 'null' }};
+    const buyHigh = {{ buy_high if buy_high is not none else 'null' }};
+    const sellLow = {{ sell_low if sell_low is not none else 'null' }};
+    const sellHigh= {{ sell_high if sell_high is not none else 'null' }};
+
+    // ==== 2. Plugin vẽ BUY/SELL ZONES ====
+    const priceZonesPlugin = {
+      id: 'priceZones',
+      beforeDraw(chart, args, pluginOptions) {
+        if (chart.canvas.id !== "priceRsiChart") return;
+        if (buyLow == null || buyHigh == null || sellLow == null || sellHigh == null) return;
+
+        const { ctx, chartArea, scales } = chart;
+        if (!chartArea) return;
+        const { left, right } = chartArea;
+        const yScale = scales['y'];
+
+        if (!yScale) return;
+
+        ctx.save();
+
+        // BUY ZONE
+        const yBuyLow  = yScale.getPixelForValue(buyLow);
+        const yBuyHigh = yScale.getPixelForValue(buyHigh);
+        const buyTop    = Math.min(yBuyHigh, yBuyLow);
+        const buyBottom = Math.max(yBuyHigh, yBuyLow);
+
+        ctx.fillStyle = "rgba(34, 197, 94, 0.12)";
+        ctx.fillRect(left, buyTop, right - left, buyBottom - buyTop);
+
+        // SELL ZONE
+        const ySellLow  = yScale.getPixelForValue(sellLow);
+        const ySellHigh = yScale.getPixelForValue(sellHigh);
+        const sellTop    = Math.min(ySellHigh, ySellLow);
+        const sellBottom = Math.max(ySellHigh, ySellLow);
+
+        ctx.fillStyle = "rgba(239, 68, 68, 0.12)";
+        ctx.fillRect(left, sellTop, right - left, sellBottom - sellTop);
+
+        ctx.restore();
+      }
+    };
+
+    // ==== 3. Tính BUY / SELL signals & trạng thái cuối (client-side) ====
+    function computeSignals(
+      prices, rsiArr, bbU, bbL, emaF, emaS, stochArr, wrArr,
+      buyLow, buyHigh, sellLow, sellHigh
+    ) {
+      const n = prices.length;
+      const buySignals  = new Array(n).fill(null);
+      const sellSignals = new Array(n).fill(null);
+      let lastState = "HOLD";
+
+      for (let i = 0; i < n; i++) {
+        const price = prices[i];
+        const rsi   = rsiArr[i];
+        const bu    = bbU[i];
+        const bl    = bbL[i];
+        const ef    = emaF[i];
+        const es    = emaS[i];
+        const stoch = stochArr[i];
+        const wr    = wrArr[i];
+
+        // BUY conditions
+        const isRsiOversold   = rsi   != null && rsi < 40;
+        const isBbTouchLow    = bl    != null && price <= bl;
+        const isStochLow      = stoch != null && stoch < 20;
+        const isWrLow         = wr    != null && wr   < -80;
+        const trendUp         = ef    != null && es   != null && ef >= es;
+
+        const condBuy1 = isRsiOversold && isBbTouchLow;
+        const condBuy2 = isStochLow && isWrLow && trendUp;
+
+        // SELL conditions
+        const isRsiOverbought = rsi   != null && rsi > 60;
+        const isBbTouchHigh   = bu    != null && price >= bu;
+        const isStochHigh     = stoch != null && stoch > 80;
+        const isWrHigh        = wr    != null && wr   > -20;
+        const trendDown       = ef    != null && es   != null && ef <= es;
+
+        const condSell1 = isRsiOverbought && isBbTouchHigh;
+        const condSell2 = isStochHigh && isWrHigh && trendDown;
+
+        // giới hạn theo zone
+        let inBuyZone = true;
+        if (buyLow !== null && buyHigh !== null) {
+          inBuyZone = price >= buyLow && price <= buyHigh;
+        }
+        let inSellZone = true;
+        if (sellLow !== null && sellHigh !== null) {
+          inSellZone = price >= sellLow && price <= sellHigh;
+        }
+
+        const isBuySignal  = (condBuy1  || condBuy2)  && inBuyZone;
+        const isSellSignal = (condSell1 || condSell2) && inSellZone;
+
+        if (isBuySignal && !isSellSignal) {
+          buySignals[i] = price;
+          lastState = "BUY";
+        } else if (isSellSignal && !isBuySignal) {
+          sellSignals[i] = price;
+          lastState = "SELL";
+        }
+      }
+
+      return { buySignals, sellSignals, lastState };
+    }
+
+    const { buySignals, sellSignals, lastState } = computeSignals(
+      prices, rsiValues, bbUpper, bbLower, emaFast, emaSlow, stochK, wrValues,
+      buyLow, buyHigh, sellLow, sellHigh
+    );
+
+    // ==== 4. Badge trạng thái cuối ====
+    const stateEl = document.getElementById("lastStateBadge");
+    if (stateEl) {
+      stateEl.textContent = lastState;
+      stateEl.classList.remove("state-buy", "state-sell", "state-hold");
+      if (lastState === "BUY")   stateEl.classList.add("state-buy");
+      else if (lastState === "SELL") stateEl.classList.add("state-sell");
+      else stateEl.classList.add("state-hold");
+    }
+
+    // ==== 5. Build points cho scatter BUY/SELL ====
+    function buildSignalPoints(signals) {
+      const pts = [];
+      for (let i = 0; i < signals.length; i++) {
+        if (signals[i] !== null && signals[i] !== undefined) {
+          pts.push({ x: labels[i], y: signals[i] });
+        }
+      }
+      return pts;
+    }
+
+    const buyPoints  = buildSignalPoints(buySignals);
+    const sellPoints = buildSignalPoints(sellSignals);
+
+    Chart.register(priceZonesPlugin);
+
+    // ==== 6. Vẽ chart Price + RSI + BUY/SELL ====
+    const ctxPriceRsi = document.getElementById("priceRsiChart").getContext("2d");
+
+    const priceRsiChart = new Chart(ctxPriceRsi, {
+      type: "line",
+      data: {
+        labels: labels,
+        datasets: [
+          {
+            label: symbol + " Price",
+            data: prices,
+            borderColor: "rgba(37, 99, 235, 1)",
+            backgroundColor: "rgba(37, 99, 235, 0.05)",
+            yAxisID: "y",
+            tension: 0.2,
+            pointRadius: 0
+          },
+          {
+            label: "RSI H4",
+            data: rsiValues,
+            borderColor: "rgba(16, 185, 129, 1)",
+            backgroundColor: "rgba(16, 185, 129, 0.05)",
+            yAxisID: "y1",
+            tension: 0.2,
+            pointRadius: 0
+          },
+          {
+            type: "scatter",
+            label: "BUY Signal",
+            data: buyPoints,
+            yAxisID: "y",
+            borderColor: "rgba(22, 163, 74, 1)",
+            backgroundColor: "rgba(22, 163, 74, 1)",
+            pointStyle: "triangle",
+            pointRadius: 6,
+            pointHoverRadius: 7
+          },
+          {
+            type: "scatter",
+            label: "SELL Signal",
+            data: sellPoints,
+            yAxisID: "y",
+            borderColor: "rgba(239, 68, 68, 1)",
+            backgroundColor: "rgba(239, 68, 68, 1)",
+            pointStyle: "triangle",
+            pointRotation: 180,
+            pointRadius: 6,
+            pointHoverRadius: 7
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { position: "top" },
+          tooltip: { mode: "index", intersect: false }
+        },
+        scales: {
+          y: {
+            type: "linear",
+            position: "left",
+            title: { display: true, text: "Price" },
+            grid: { drawOnChartArea: true }
+          },
+          y1: {
+            type: "linear",
+            position: "right",
+            title: { display: true, text: "RSI H4" },
+            min: 0,
+            max: 100,
+            grid: { drawOnChartArea: false }
+          },
+          x: {
+            ticks: { maxRotation: 60, minRotation: 45 }
+          }
+        }
+      }
+    });
+  </script>
+</body>
+</html>
