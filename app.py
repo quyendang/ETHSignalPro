@@ -1048,9 +1048,20 @@ async def backtest_symbol(
     symbol = symbol.upper()
     
     try:
-        # Parse dates
-        start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        # Parse dates - ensure timezone aware
+        if start_date.endswith("Z"):
+            start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+        else:
+            start_dt = datetime.fromisoformat(start_date)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+        
+        if end_date.endswith("Z"):
+            end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        else:
+            end_dt = datetime.fromisoformat(end_date)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
         
         if start_dt >= end_dt:
             return JSONResponse(
@@ -1060,15 +1071,28 @@ async def backtest_symbol(
         
         # Fetch klines từ Binance
         if mode == "history":
-            # Lấy dữ liệu lịch sử
-            start_ts = int(start_dt.timestamp() * 1000)
+            # Tính interval milliseconds
+            interval_ms_map = {
+                "1m": 60_000, "5m": 5 * 60_000, "15m": 15 * 60_000,
+                "1h": 60 * 60_000, "4h": 4 * 60 * 60_000, "1d": 24 * 60 * 60_000
+            }
+            interval_ms = interval_ms_map.get(interval, 4 * 60 * 60_000)
+            
+            # Fetch thêm lookback candles trước start_date để có đủ dữ liệu
+            # Tính start_ts sớm hơn để có đủ lookback
+            lookback_ms = lookback * interval_ms
+            start_ts = int((start_dt.timestamp() * 1000) - lookback_ms)
             end_ts = int(end_dt.timestamp() * 1000)
             
             all_klines = []
             current_ts = start_ts
             limit = 1000  # Binance max limit
+            seen_timestamps = set()  # Để tránh duplicate
+            max_iterations = 100  # Giới hạn số lần lặp để tránh infinite loop
+            iteration = 0
             
-            while current_ts < end_ts:
+            while current_ts < end_ts and iteration < max_iterations:
+                iteration += 1
                 url = "https://api.binance.com/api/v3/klines"
                 params = {
                     "symbol": symbol,
@@ -1084,14 +1108,38 @@ async def backtest_symbol(
                 if not batch:
                     break
                 
-                all_klines.extend(batch)
-                current_ts = batch[-1][0] + 1  # Next start time
+                # Add only new klines (avoid duplicates)
+                for k in batch:
+                    k_ts = int(k[0])
+                    if k_ts not in seen_timestamps:
+                        seen_timestamps.add(k_ts)
+                        all_klines.append(k)
                 
+                # Update current_ts to next timestamp
+                if batch:
+                    last_ts = int(batch[-1][0])
+                    current_ts = last_ts + interval_ms  # Next candle time
+                else:
+                    break
+                
+                # Nếu batch nhỏ hơn limit, đã hết dữ liệu
                 if len(batch) < limit:
                     break
+            
+            # Sort by timestamp để đảm bảo thứ tự
+            all_klines.sort(key=lambda x: int(x[0]))
+            
+            logging.info(f"[BACKTEST] Fetched {len(all_klines)} candles for {symbol} (history mode)")
+            
         else:  # realtime
             # Lấy dữ liệu realtime (từ hiện tại trở về trước)
-            limit = int((end_dt - start_dt).total_seconds() / (4 * 3600)) + 100  # Approximate
+            # Tính số candles cần thiết
+            interval_seconds = {
+                "1m": 60, "5m": 300, "15m": 900, "1h": 3600,
+                "4h": 14400, "1d": 86400
+            }.get(interval, 14400)
+            
+            limit = int((end_dt - start_dt).total_seconds() / interval_seconds) + 200
             url = "https://api.binance.com/api/v3/klines"
             params = {
                 "symbol": symbol,
@@ -1102,10 +1150,11 @@ async def backtest_symbol(
             resp.raise_for_status()
             all_klines = resp.json()
             
-            # Filter theo date range
+            # Filter theo date range (đảm bảo timezone aware)
             filtered_klines = []
             for k in all_klines:
-                k_time = datetime.utcfromtimestamp(int(k[0]) / 1000.0)
+                k_ts_ms = int(k[0])
+                k_time = datetime.utcfromtimestamp(k_ts_ms / 1000.0).replace(tzinfo=timezone.utc)
                 if start_dt <= k_time <= end_dt:
                     filtered_klines.append(k)
             all_klines = filtered_klines
@@ -1116,7 +1165,7 @@ async def backtest_symbol(
                 status_code=404
             )
         
-        # Process klines
+        # Process klines - đảm bảo timezone aware
         closes = []
         highs = []
         lows = []
@@ -1125,20 +1174,41 @@ async def backtest_symbol(
         for k in all_klines:
             try:
                 ts_ms = int(k[0])
-                dt = datetime.utcfromtimestamp(ts_ms / 1000.0)
+                dt = datetime.utcfromtimestamp(ts_ms / 1000.0).replace(tzinfo=timezone.utc)
                 
-                if start_dt <= dt <= end_dt:
-                    timestamps.append(dt.isoformat() + "Z")
-                    closes.append(float(k[4]))
-                    highs.append(float(k[2]))
-                    lows.append(float(k[3]))
+                # Với history mode: lấy tất cả candles (bao gồm cả trước start_dt để có lookback)
+                # Với realtime mode: chỉ lấy trong range
+                if mode == "realtime":
+                    if not (start_dt <= dt <= end_dt):
+                        continue
+                # Với history mode: chỉ lấy candles <= end_dt (có thể có candles trước start_dt)
+                elif mode == "history":
+                    if dt > end_dt:
+                        continue
+                
+                timestamps.append(dt.isoformat().replace("+00:00", "Z"))
+                closes.append(float(k[4]))
+                highs.append(float(k[2]))
+                lows.append(float(k[3]))
             except Exception as e:
                 logging.warning(f"[BACKTEST] Bad kline: {e}")
                 continue
         
         if len(closes) < lookback + 10:
+            logging.warning(
+                f"[BACKTEST] Not enough data: need {lookback + 10}, got {len(closes)}. "
+                f"Symbol: {symbol}, Mode: {mode}, Start: {start_date}, End: {end_date}"
+            )
             return JSONResponse(
-                {"error": f"Not enough data (need at least {lookback + 10} candles)"},
+                {
+                    "error": f"Not enough data (need at least {lookback + 10} candles, got {len(closes)})",
+                    "received_candles": len(closes),
+                    "required": lookback + 10,
+                    "symbol": symbol,
+                    "mode": mode,
+                    "start_date": start_date,
+                    "end_date": end_date
+                },
                 status_code=400
             )
         
@@ -1157,12 +1227,25 @@ async def backtest_symbol(
         btc_klines = []
         try:
             if mode == "history":
-                start_ts = int(start_dt.timestamp() * 1000)
+                # Tính interval milliseconds
+                interval_ms_map = {
+                    "1m": 60_000, "5m": 5 * 60_000, "15m": 15 * 60_000,
+                    "1h": 60 * 60_000, "4h": 4 * 60 * 60_000, "1d": 24 * 60 * 60_000
+                }
+                interval_ms = interval_ms_map.get(interval, 4 * 60 * 60_000)
+                
+                # Fetch thêm lookback candles trước start_date
+                lookback_ms = lookback * interval_ms
+                start_ts = int((start_dt.timestamp() * 1000) - lookback_ms)
                 end_ts = int(end_dt.timestamp() * 1000)
                 current_ts = start_ts
                 limit = 1000
+                btc_seen_timestamps = set()
+                max_iterations = 100
+                iteration = 0
                 
-                while current_ts < end_ts:
+                while current_ts < end_ts and iteration < max_iterations:
+                    iteration += 1
                     url = "https://api.binance.com/api/v3/klines"
                     params = {
                         "symbol": "BTCUSDT",
@@ -1176,12 +1259,33 @@ async def backtest_symbol(
                     batch = resp.json()
                     if not batch:
                         break
-                    btc_klines.extend(batch)
-                    current_ts = batch[-1][0] + 1
+                    
+                    # Add only new klines (avoid duplicates)
+                    for k in batch:
+                        k_ts = int(k[0])
+                        if k_ts not in btc_seen_timestamps:
+                            btc_seen_timestamps.add(k_ts)
+                            btc_klines.append(k)
+                    
+                    if batch:
+                        last_ts = int(batch[-1][0])
+                        current_ts = last_ts + interval_ms
+                    else:
+                        break
+                    
                     if len(batch) < limit:
                         break
+                
+                # Sort by timestamp
+                btc_klines.sort(key=lambda x: int(x[0]))
             else:
-                limit = int((end_dt - start_dt).total_seconds() / (4 * 3600)) + 100
+                # Realtime mode
+                interval_seconds = {
+                    "1m": 60, "5m": 300, "15m": 900, "1h": 3600,
+                    "4h": 14400, "1d": 86400
+                }.get(interval, 14400)
+                
+                limit = int((end_dt - start_dt).total_seconds() / interval_seconds) + 200
                 url = "https://api.binance.com/api/v3/klines"
                 params = {
                     "symbol": "BTCUSDT",
@@ -1195,16 +1299,26 @@ async def backtest_symbol(
             logging.warning(f"[BACKTEST] Error fetching BTC data: {e}")
             btc_klines = []
         
-        # Process BTC klines
+        # Process BTC klines - đảm bảo timezone aware
         btc_closes = []
         btc_timestamps = []
         for k in btc_klines:
             try:
                 ts_ms = int(k[0])
-                dt = datetime.utcfromtimestamp(ts_ms / 1000.0)
-                if start_dt <= dt <= end_dt:
-                    btc_timestamps.append(dt.isoformat() + "Z")
-                    btc_closes.append(float(k[4]))
+                dt = datetime.utcfromtimestamp(ts_ms / 1000.0).replace(tzinfo=timezone.utc)
+                
+                # Với history mode: lấy tất cả candles (bao gồm cả trước start_dt để có lookback)
+                # Với realtime mode: chỉ lấy trong range
+                if mode == "realtime":
+                    if not (start_dt <= dt <= end_dt):
+                        continue
+                # Với history mode: chỉ lấy candles <= end_dt (có thể có candles trước start_dt)
+                elif mode == "history":
+                    if dt > end_dt:
+                        continue
+                
+                btc_timestamps.append(dt.isoformat().replace("+00:00", "Z"))
+                btc_closes.append(float(k[4]))
             except Exception:
                 continue
         
@@ -1218,11 +1332,23 @@ async def backtest_symbol(
             )
         
         # Tính zones và signals cho mỗi điểm
+        # Chỉ tính cho các điểm trong range start_dt đến end_dt
         signals = []
         buy_count = 0
         sell_count = 0
         
-        for i in range(lookback, len(closes)):
+        # Tìm index bắt đầu (điểm đầu tiên >= start_dt)
+        start_idx = 0
+        for i, ts in enumerate(timestamps):
+            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts_dt >= start_dt:
+                start_idx = i
+                break
+        
+        # Đảm bảo có đủ lookback candles trước start_idx
+        actual_start_idx = max(lookback, start_idx)
+        
+        for i in range(actual_start_idx, len(closes)):
             try:
                 # Tính zones dựa trên lookback candles trước đó
                 window_highs = highs[i - lookback:i]
@@ -1272,6 +1398,11 @@ async def backtest_symbol(
                         btc_macd_hist = btc_macd_hist_values[closest_idx]
                     if closest_idx > 0 and closest_idx - 1 < len(btc_macd_hist_values):
                         btc_prev_macd_hist = btc_macd_hist_values[closest_idx - 1]
+                
+                # Chỉ tính signals cho các điểm trong range start_dt đến end_dt
+                current_ts_dt = datetime.fromisoformat(timestamps[i].replace("Z", "+00:00"))
+                if current_ts_dt < start_dt or current_ts_dt > end_dt:
+                    continue
                 
                 # Quyết định action (dùng logic _eth_decide_action)
                 zones = (sell_low, sell_high, buy_low, buy_high, recent_low, recent_high)
@@ -1384,5 +1515,4 @@ if __name__ == "__main__":
         reload=False,  # Disable reload for production-like testing
         workers=1,
     )
-
 
