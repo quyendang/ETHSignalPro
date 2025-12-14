@@ -290,6 +290,44 @@
       </div>
       <canvas id="priceRsiChart" height="260"></canvas>
     </section>
+
+    <!-- BACKTEST SECTION -->
+    <section class="panel" style="margin-top: 20px;">
+      <div class="panel-title">
+        <div>Backtest Analysis</div>
+      </div>
+      
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px;">
+        <div>
+          <label style="display: block; font-size: 0.85rem; color: var(--text-sub); margin-bottom: 4px;">Start Date</label>
+          <input type="datetime-local" id="backtestStartDate" style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 8px; font-size: 0.9rem;" />
+        </div>
+        <div>
+          <label style="display: block; font-size: 0.85rem; color: var(--text-sub); margin-bottom: 4px;">End Date</label>
+          <input type="datetime-local" id="backtestEndDate" style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 8px; font-size: 0.9rem;" />
+        </div>
+        <div>
+          <label style="display: block; font-size: 0.85rem; color: var(--text-sub); margin-bottom: 4px;">Lookback Candles</label>
+          <input type="number" id="backtestLookback" value="60" min="20" max="200" style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 8px; font-size: 0.9rem;" />
+        </div>
+      </div>
+      
+      <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+        <button id="btnHistoryBacktest" style="flex: 1; padding: 10px 16px; background: var(--accent); color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.9rem;">
+          HIS BACKTEST
+        </button>
+        <button id="btnRealtimeBacktest" style="flex: 1; padding: 10px 16px; background: var(--green); color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.9rem;">
+          REAL BACKTEST
+        </button>
+      </div>
+      
+      <div id="backtestResults" style="display: none; padding: 12px; background: rgba(37, 99, 235, 0.05); border-radius: 8px; margin-top: 12px;">
+        <div style="font-size: 0.85rem; color: var(--text-sub); margin-bottom: 8px;">
+          <strong>Results:</strong> <span id="backtestStats"></span>
+        </div>
+        <div id="backtestError" style="color: var(--red); font-size: 0.85rem; display: none;"></div>
+      </div>
+    </section>
   </div>
 
   <!-- ================= SCRIPT ================= -->
@@ -451,7 +489,7 @@
     // ==== 6. Vẽ chart Price + RSI + BUY/SELL ====
     const ctxPriceRsi = document.getElementById("priceRsiChart").getContext("2d");
 
-    const priceRsiChart = new Chart(ctxPriceRsi, {
+    let priceRsiChart = new Chart(ctxPriceRsi, {
       type: "line",
       data: {
         labels: labels,
@@ -526,6 +564,169 @@
           }
         }
       }
+    });
+
+    // ==== 7. BACKTEST FUNCTIONALITY ====
+    // Set default dates (30 days ago to today)
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    
+    const formatDateForInput = (date) => {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      return `${year}-${month}-${day}T${hours}:${minutes}`;
+    };
+    
+    document.getElementById("backtestStartDate").value = formatDateForInput(thirtyDaysAgo);
+    document.getElementById("backtestEndDate").value = formatDateForInput(now);
+    
+    // Backtest datasets (will be added to chart)
+    let backtestBuyDataset = null;
+    let backtestSellDataset = null;
+    
+    async function runBacktest(mode) {
+      const startDate = document.getElementById("backtestStartDate").value;
+      const endDate = document.getElementById("backtestEndDate").value;
+      const lookback = parseInt(document.getElementById("backtestLookback").value) || 60;
+      
+      if (!startDate || !endDate) {
+        alert("Please select both start and end dates");
+        return;
+      }
+      
+      // Convert to ISO format for API
+      const startISO = new Date(startDate).toISOString();
+      const endISO = new Date(endDate).toISOString();
+      
+      const resultsDiv = document.getElementById("backtestResults");
+      const statsDiv = document.getElementById("backtestStats");
+      const errorDiv = document.getElementById("backtestError");
+      
+      resultsDiv.style.display = "block";
+      errorDiv.style.display = "none";
+      statsDiv.textContent = "Running backtest...";
+      
+      try {
+        const formData = new FormData();
+        formData.append("symbol", symbol);
+        formData.append("start_date", startISO);
+        formData.append("end_date", endISO);
+        formData.append("interval", "4h");
+        formData.append("lookback", lookback.toString());
+        formData.append("mode", mode);
+        
+        const response = await fetch("/bots/backtest", {
+          method: "POST",
+          body: formData
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.error || "Backtest failed");
+        }
+        
+        // Display stats
+        statsDiv.textContent = `Total: ${data.total_candles} candles | BUY: ${data.buy_count} | SELL: ${data.sell_count}`;
+        
+        // Remove old backtest datasets
+        if (backtestBuyDataset !== null) {
+          priceRsiChart.data.datasets.splice(priceRsiChart.data.datasets.indexOf(backtestBuyDataset), 1);
+        }
+        if (backtestSellDataset !== null) {
+          priceRsiChart.data.datasets.splice(priceRsiChart.data.datasets.indexOf(backtestSellDataset), 1);
+        }
+        
+        // Map backtest signals to chart labels
+        // Find closest label index for each signal timestamp
+        const findClosestLabelIndex = (signalTime) => {
+          const signalDate = new Date(signalTime);
+          let closestIdx = 0;
+          let minDiff = Infinity;
+          
+          for (let i = 0; i < labels.length; i++) {
+            const labelDate = new Date(labels[i]);
+            const diff = Math.abs(signalDate - labelDate);
+            if (diff < minDiff) {
+              minDiff = diff;
+              closestIdx = i;
+            }
+          }
+          return closestIdx;
+        };
+        
+        // Add backtest signals to chart (map to closest label)
+        const buySignals = data.signals
+          .filter(s => s.action === "BUY")
+          .map(s => {
+            const idx = findClosestLabelIndex(s.time);
+            return {
+              x: labels[idx] || s.time,
+              y: s.price
+            };
+          });
+        
+        const sellSignals = data.signals
+          .filter(s => s.action === "SELL")
+          .map(s => {
+            const idx = findClosestLabelIndex(s.time);
+            return {
+              x: labels[idx] || s.time,
+              y: s.price
+            };
+          });
+        
+        // Add BUY signals dataset
+        backtestBuyDataset = {
+          type: "scatter",
+          label: "Backtest BUY",
+          data: buySignals,
+          yAxisID: "y",
+          borderColor: "rgba(34, 197, 94, 0.8)",
+          backgroundColor: "rgba(34, 197, 94, 0.6)",
+          pointStyle: "circle",
+          pointRadius: 8,
+          pointHoverRadius: 10,
+          borderWidth: 2
+        };
+        
+        // Add SELL signals dataset
+        backtestSellDataset = {
+          type: "scatter",
+          label: "Backtest SELL",
+          data: sellSignals,
+          yAxisID: "y",
+          borderColor: "rgba(239, 68, 68, 0.8)",
+          backgroundColor: "rgba(239, 68, 68, 0.6)",
+          pointStyle: "circle",
+          pointRadius: 8,
+          pointHoverRadius: 10,
+          borderWidth: 2
+        };
+        
+        priceRsiChart.data.datasets.push(backtestBuyDataset);
+        priceRsiChart.data.datasets.push(backtestSellDataset);
+        
+        // Update chart
+        priceRsiChart.update();
+        
+      } catch (error) {
+        errorDiv.style.display = "block";
+        errorDiv.textContent = `Error: ${error.message}`;
+        statsDiv.textContent = "";
+      }
+    }
+    
+    // Event listeners
+    document.getElementById("btnHistoryBacktest").addEventListener("click", () => {
+      runBacktest("history");
+    });
+    
+    document.getElementById("btnRealtimeBacktest").addEventListener("click", () => {
+      runBacktest("realtime");
     });
   </script>
 </body>
