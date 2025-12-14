@@ -36,7 +36,7 @@ BASE_DIR = Path(__file__).resolve().parent
 logging.basicConfig(level=logging.INFO)
 
 # PostgreSQL ENV (Koyeb)
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://koyeb-adm:*******@ep-aged-bush-a1op42oy.ap-southeast-1.pg.koyeb.app/koyebdb")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://koyeb-adm:*******@ep-agt-1.pg.koyeb.app/koyebdb")
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL phải được thiết lập trong biến môi trường.")
