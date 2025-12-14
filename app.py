@@ -36,7 +36,7 @@ BASE_DIR = Path(__file__).resolve().parent
 logging.basicConfig(level=logging.INFO)
 
 # PostgreSQL ENV (Koyeb)
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://koyeb-adm:*******@ep-agt-1.pg.koyeb.app/koyebdb")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://koyeb-adm:*******@ep-aged-bush-a1op42oy.ap-southeast-1.pg.koyeb.app/koyebdb")
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL phải được thiết lập trong biến môi trường.")
@@ -1029,6 +1029,308 @@ async def symbol_dashboard(request: Request, symbol: str):
 
     return templates.TemplateResponse("symbol_dashboard.html", context)
 
+
+@_rsi_router.post("/backtest")
+async def backtest_symbol(
+    symbol: str = Form(...),
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    interval: str = Form("4h"),
+    lookback: int = Form(60),
+    mode: str = Form("history"),  # "history" or "realtime"
+):
+    """
+    Backtest symbol với thuật toán buy/sell zone và signals.
+    mode: "history" (dữ liệu lịch sử) hoặc "realtime" (dữ liệu realtime)
+    """
+    from fastapi.responses import JSONResponse
+    
+    symbol = symbol.upper()
+    
+    try:
+        # Parse dates
+        start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        
+        if start_dt >= end_dt:
+            return JSONResponse(
+                {"error": "Start date must be before end date"},
+                status_code=400
+            )
+        
+        # Fetch klines từ Binance
+        if mode == "history":
+            # Lấy dữ liệu lịch sử
+            start_ts = int(start_dt.timestamp() * 1000)
+            end_ts = int(end_dt.timestamp() * 1000)
+            
+            all_klines = []
+            current_ts = start_ts
+            limit = 1000  # Binance max limit
+            
+            while current_ts < end_ts:
+                url = "https://api.binance.com/api/v3/klines"
+                params = {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "startTime": current_ts,
+                    "endTime": end_ts,
+                    "limit": limit,
+                }
+                resp = requests.get(url, params=params, timeout=15)
+                resp.raise_for_status()
+                batch = resp.json()
+                
+                if not batch:
+                    break
+                
+                all_klines.extend(batch)
+                current_ts = batch[-1][0] + 1  # Next start time
+                
+                if len(batch) < limit:
+                    break
+        else:  # realtime
+            # Lấy dữ liệu realtime (từ hiện tại trở về trước)
+            limit = int((end_dt - start_dt).total_seconds() / (4 * 3600)) + 100  # Approximate
+            url = "https://api.binance.com/api/v3/klines"
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": min(limit, 1000),
+            }
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            all_klines = resp.json()
+            
+            # Filter theo date range
+            filtered_klines = []
+            for k in all_klines:
+                k_time = datetime.utcfromtimestamp(int(k[0]) / 1000.0)
+                if start_dt <= k_time <= end_dt:
+                    filtered_klines.append(k)
+            all_klines = filtered_klines
+        
+        if not all_klines:
+            return JSONResponse(
+                {"error": "No data found for the specified date range"},
+                status_code=404
+            )
+        
+        # Process klines
+        closes = []
+        highs = []
+        lows = []
+        timestamps = []
+        
+        for k in all_klines:
+            try:
+                ts_ms = int(k[0])
+                dt = datetime.utcfromtimestamp(ts_ms / 1000.0)
+                
+                if start_dt <= dt <= end_dt:
+                    timestamps.append(dt.isoformat() + "Z")
+                    closes.append(float(k[4]))
+                    highs.append(float(k[2]))
+                    lows.append(float(k[3]))
+            except Exception as e:
+                logging.warning(f"[BACKTEST] Bad kline: {e}")
+                continue
+        
+        if len(closes) < lookback + 10:
+            return JSONResponse(
+                {"error": f"Not enough data (need at least {lookback + 10} candles)"},
+                status_code=400
+            )
+        
+        # Tính indicators
+        rsi_values = _compute_rsi_series(closes, RSI_PERIOD)
+        macd_line, macd_signal, macd_hist_values = _compute_macd_series(
+            closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL
+        )
+        ema_fast = _compute_ema_series(closes, 12)
+        ema_slow = _compute_ema_series(closes, 26)
+        bb_middle, bb_upper, bb_lower = _bollinger_bands(closes, period=20, k=2.0)
+        stoch_k = _stochastic_oscillator(highs, lows, closes, period=14)
+        williams_r = _williams_r(highs, lows, closes, period=14)
+        
+        # Fetch BTC data for the same period (for BTC filter)
+        btc_klines = []
+        try:
+            if mode == "history":
+                start_ts = int(start_dt.timestamp() * 1000)
+                end_ts = int(end_dt.timestamp() * 1000)
+                current_ts = start_ts
+                limit = 1000
+                
+                while current_ts < end_ts:
+                    url = "https://api.binance.com/api/v3/klines"
+                    params = {
+                        "symbol": "BTCUSDT",
+                        "interval": interval,
+                        "startTime": current_ts,
+                        "endTime": end_ts,
+                        "limit": limit,
+                    }
+                    resp = requests.get(url, params=params, timeout=15)
+                    resp.raise_for_status()
+                    batch = resp.json()
+                    if not batch:
+                        break
+                    btc_klines.extend(batch)
+                    current_ts = batch[-1][0] + 1
+                    if len(batch) < limit:
+                        break
+            else:
+                limit = int((end_dt - start_dt).total_seconds() / (4 * 3600)) + 100
+                url = "https://api.binance.com/api/v3/klines"
+                params = {
+                    "symbol": "BTCUSDT",
+                    "interval": interval,
+                    "limit": min(limit, 1000),
+                }
+                resp = requests.get(url, params=params, timeout=15)
+                resp.raise_for_status()
+                btc_klines = resp.json()
+        except Exception as e:
+            logging.warning(f"[BACKTEST] Error fetching BTC data: {e}")
+            btc_klines = []
+        
+        # Process BTC klines
+        btc_closes = []
+        btc_timestamps = []
+        for k in btc_klines:
+            try:
+                ts_ms = int(k[0])
+                dt = datetime.utcfromtimestamp(ts_ms / 1000.0)
+                if start_dt <= dt <= end_dt:
+                    btc_timestamps.append(dt.isoformat() + "Z")
+                    btc_closes.append(float(k[4]))
+            except Exception:
+                continue
+        
+        # Calculate BTC indicators
+        btc_rsi_values = []
+        btc_macd_hist_values = []
+        if btc_closes and len(btc_closes) >= 50:
+            btc_rsi_values = _compute_rsi_series(btc_closes, RSI_PERIOD)
+            _, _, btc_macd_hist_values = _compute_macd_series(
+                btc_closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL
+            )
+        
+        # Tính zones và signals cho mỗi điểm
+        signals = []
+        buy_count = 0
+        sell_count = 0
+        
+        for i in range(lookback, len(closes)):
+            try:
+                # Tính zones dựa trên lookback candles trước đó
+                window_highs = highs[i - lookback:i]
+                window_lows = lows[i - lookback:i]
+                
+                if not window_highs or not window_lows:
+                    continue
+                
+                recent_high = max(window_highs)
+                recent_low = min(window_lows)
+                price_range = recent_high - recent_low
+                
+                if price_range <= 0:
+                    continue
+                
+                zone_pct = 0.2
+                buy_low = recent_low
+                buy_high = recent_low + zone_pct * price_range
+                sell_high = recent_high
+                sell_low = recent_high - zone_pct * price_range
+                
+                price = closes[i]
+                rsi = rsi_values[i] if i < len(rsi_values) else 50.0
+                macd_hist = macd_hist_values[i] if i < len(macd_hist_values) else 0.0
+                prev_macd_hist = macd_hist_values[i - 1] if i > 0 and i - 1 < len(macd_hist_values) else None
+                
+                # Get BTC data for this point (find closest timestamp)
+                btc_rsi_h4 = 50.0
+                btc_macd_hist = 0.0
+                btc_prev_macd_hist = None
+                
+                if btc_timestamps and len(btc_timestamps) > 0:
+                    # Find closest BTC timestamp
+                    current_ts = timestamps[i]
+                    closest_idx = 0
+                    min_diff = float('inf')
+                    for idx, btc_ts in enumerate(btc_timestamps):
+                        diff = abs((datetime.fromisoformat(current_ts.replace("Z", "+00:00")) - 
+                                   datetime.fromisoformat(btc_ts.replace("Z", "+00:00"))).total_seconds())
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_idx = idx
+                    
+                    if closest_idx < len(btc_rsi_values):
+                        btc_rsi_h4 = btc_rsi_values[closest_idx]
+                    if closest_idx < len(btc_macd_hist_values):
+                        btc_macd_hist = btc_macd_hist_values[closest_idx]
+                    if closest_idx > 0 and closest_idx - 1 < len(btc_macd_hist_values):
+                        btc_prev_macd_hist = btc_macd_hist_values[closest_idx - 1]
+                
+                # Quyết định action (dùng logic _eth_decide_action)
+                zones = (sell_low, sell_high, buy_low, buy_high, recent_low, recent_high)
+                decision = _eth_decide_action(
+                    price=price,
+                    rsi_h4=rsi,
+                    macd_hist=macd_hist,
+                    prev_macd_hist=prev_macd_hist,
+                    zones=zones,
+                    btc_rsi_h4=btc_rsi_h4,
+                    btc_macd_hist=btc_macd_hist,
+                    btc_prev_macd_hist=btc_prev_macd_hist,
+                )
+                
+                action = decision["action"]
+                
+                if action == "BUY":
+                    buy_count += 1
+                    signals.append({
+                        "time": timestamps[i],
+                        "price": price,
+                        "action": "BUY",
+                        "rsi": rsi,
+                        "macd_hist": macd_hist,
+                    })
+                elif action == "SELL":
+                    sell_count += 1
+                    signals.append({
+                        "time": timestamps[i],
+                        "price": price,
+                        "action": "SELL",
+                        "rsi": rsi,
+                        "macd_hist": macd_hist,
+                    })
+            except Exception as e:
+                logging.warning(f"[BACKTEST] Error processing candle {i}: {e}")
+                continue
+        
+        return JSONResponse({
+            "symbol": symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "interval": interval,
+            "total_candles": len(closes),
+            "signals": signals,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "prices": closes,
+            "timestamps": timestamps,
+        })
+        
+    except Exception as e:
+        logging.error(f"[BACKTEST] Error: {e}")
+        return JSONResponse(
+            {"error": str(e)},
+            status_code=500
+        )
+
+
 # ------------------------------------------------------------------
 # 5) SCHEDULER INIT
 # ------------------------------------------------------------------
@@ -1082,4 +1384,5 @@ if __name__ == "__main__":
         reload=False,  # Disable reload for production-like testing
         workers=1,
     )
+
 
