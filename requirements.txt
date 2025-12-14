@@ -3,3 +3,4 @@ uvicorn
 requests
 numpy
 python-dotenv
+asyncpg
