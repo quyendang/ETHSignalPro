@@ -475,7 +475,11 @@
       const pts = [];
       for (let i = 0; i < signals.length; i++) {
         if (signals[i] !== null && signals[i] !== undefined) {
-          pts.push({ x: labels[i], y: signals[i] });
+          pts.push({ 
+            x: labels[i], 
+            y: signals[i],
+            price: signals[i]  // Lưu giá để plugin hiển thị
+          });
         }
       }
       return pts;
@@ -485,6 +489,105 @@
     const sellPoints = buildSignalPoints(sellSignals);
 
     Chart.register(priceZonesPlugin);
+
+    // ==== 6. Plugin hiển thị labels giá tại các điểm buy/sell ====
+    const priceLabelPlugin = {
+      id: 'priceLabel',
+      afterDatasetsDraw(chart, args, pluginOptions) {
+        const { ctx, chartArea, scales } = chart;
+        if (!chartArea) return;
+        
+        const yScale = scales['y'];
+        if (!yScale) return;
+        
+        ctx.save();
+        ctx.font = 'bold 11px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        
+        // Helper function để vẽ rounded rectangle (fallback nếu không có roundRect)
+        const drawRoundedRect = (x, y, width, height, radius) => {
+          ctx.beginPath();
+          ctx.moveTo(x + radius, y);
+          ctx.lineTo(x + width - radius, y);
+          ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+          ctx.lineTo(x + width, y + height - radius);
+          ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+          ctx.lineTo(x + radius, y + height);
+          ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+          ctx.lineTo(x, y + radius);
+          ctx.quadraticCurveTo(x, y, x + radius, y);
+          ctx.closePath();
+        };
+        
+        // Vẽ labels cho tất cả datasets
+        chart.data.datasets.forEach((dataset, datasetIndex) => {
+          // Chỉ vẽ labels cho scatter datasets (buy/sell signals)
+          if (dataset.type !== 'scatter' || !dataset.data || dataset.data.length === 0) {
+            return;
+          }
+          
+          const meta = chart.getDatasetMeta(datasetIndex);
+          const isBuy = dataset.label && (dataset.label.includes('BUY') || dataset.label.includes('Buy'));
+          const isSell = dataset.label && (dataset.label.includes('SELL') || dataset.label.includes('Sell'));
+          
+          if (!isBuy && !isSell) return;
+          
+          meta.data.forEach((point, index) => {
+            if (!point || point.skip) return;
+            
+            const x = point.x;
+            const y = point.y;
+            
+            // Lấy giá từ data point (có thể là object với property price hoặc là giá trị số)
+            let price;
+            const dataPoint = dataset.data[index];
+            if (typeof dataPoint === 'object' && dataPoint !== null) {
+              price = dataPoint.price || dataPoint.y;
+            } else {
+              price = dataPoint;
+            }
+            
+            if (price === null || price === undefined) return;
+            
+            // Format giá
+            const labelText = '$' + parseFloat(price).toFixed(2);
+            const textMetrics = ctx.measureText(labelText);
+            const textWidth = textMetrics.width;
+            const textHeight = 14;
+            const padding = 4;
+            
+            // Vị trí label (phía trên điểm cho BUY, phía dưới cho SELL)
+            const labelY = isBuy ? y - 20 : y + 20;
+            
+            // Vẽ background rounded rectangle
+            ctx.fillStyle = isBuy ? 'rgba(34, 197, 94, 0.9)' : 'rgba(239, 68, 68, 0.9)';
+            const rectX = x - textWidth / 2 - padding;
+            const rectY = labelY - textHeight / 2 - padding;
+            const rectWidth = textWidth + padding * 2;
+            const rectHeight = textHeight + padding * 2;
+            
+            // Sử dụng roundRect nếu có, nếu không dùng fallback
+            if (ctx.roundRect) {
+              ctx.beginPath();
+              ctx.roundRect(rectX, rectY, rectWidth, rectHeight, 4);
+              ctx.fill();
+            } else {
+              drawRoundedRect(rectX, rectY, rectWidth, rectHeight, 4);
+              ctx.fill();
+            }
+            
+            // Vẽ text
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(labelText, x, labelY);
+          });
+        });
+        
+        ctx.restore();
+      }
+    };
+    
+    Chart.register(priceLabelPlugin);
 
     // ==== 6. Vẽ chart Price + RSI + BUY/SELL ====
     const ctxPriceRsi = document.getElementById("priceRsiChart").getContext("2d");
@@ -659,13 +762,15 @@
         };
         
         // Add backtest signals to chart (map to closest label)
+        // Lưu cả giá để hiển thị label
         const buySignals = data.signals
           .filter(s => s.action === "BUY")
           .map(s => {
             const idx = findClosestLabelIndex(s.time);
             return {
               x: labels[idx] || s.time,
-              y: s.price
+              y: s.price,
+              price: s.price  // Lưu giá để plugin hiển thị
             };
           });
         
@@ -675,7 +780,8 @@
             const idx = findClosestLabelIndex(s.time);
             return {
               x: labels[idx] || s.time,
-              y: s.price
+              y: s.price,
+              price: s.price  // Lưu giá để plugin hiển thị
             };
           });
         
