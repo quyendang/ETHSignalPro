@@ -1,8 +1,8 @@
 fastapi
 uvicorn[standard]
-jinja2
-asyncpg
-apscheduler
-requests
+httpx
+pandas
+numpy
 python-dotenv
+apscheduler
 python-multipart
