@@ -35,8 +35,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # Position (for personalization)
-SPOT_ETH = float(os.getenv("SPOT_ETH", "0") or 0)
-AVG_ENTRY = float(os.getenv("AVG_ENTRY", "0") or 0)
+SPOT_ETH = float(os.getenv("SPOT_ETH", "100") or 0)
+AVG_ENTRY = float(os.getenv("AVG_ENTRY", "3150") or 0)
 
 # Loan sizing limits (suggestion only)
 MAX_LOAN_USDT = float(os.getenv("MAX_LOAN_USDT", "0") or 0)
@@ -349,17 +349,37 @@ class StrategyEngine:
             (hard_buy2[0] <= m.eth_price <= hard_buy2[1]) or
             (m.eth_price <= m.eth_bb_lower_4h * 1.01)
         )
-        if buyback_ok:
+        
+        # BTC safety: không buyback khi BTC đang breakdown mạnh
+        btc_breakdown = (m.btc_macd_hist_4h < 0) and (m.btc_rsi_4h < 30)
+        
+        if buyback_ok and not btc_breakdown:
             return Signal(
                 action="BUYBACK",
                 confidence="med",
-                message=f"Vùng mua lại: ETH {m.eth_price:.0f} vào hỗ trợ/BB lower. Ưu tiên mua lại phần đã bán.",
+                message=f"Vùng mua lại: ETH {m.eth_price:.0f} vào hỗ trợ/BB lower và BTC không breakdown mạnh. Ưu tiên mua lại phần đã bán.",
                 meta={
                     "buy_zones": {"hard1": hard_buy1, "hard2": hard_buy2, "bb_lower": round(m.eth_bb_lower_4h)},
                     "eth_rsi_4h": m.eth_rsi_4h,
                     "btc_price": m.btc_price,
+                    "btc_breakdown": btc_breakdown,
                 },
             )
+        
+        # Nếu ETH vào vùng mua nhưng BTC đang breakdown -> WAIT
+        if buyback_ok and btc_breakdown:
+            return Signal(
+                action="HOLD",
+                confidence="med",
+                message=f"ETH vào vùng mua ({m.eth_price:.0f}) nhưng BTC đang breakdown ({m.btc_price:.0f}). Không buyback, chờ BTC ổn định.",
+                meta={
+                    "eth_price": m.eth_price,
+                    "btc_price": m.btc_price,
+                    "btc_rsi_4h": m.btc_rsi_4h,
+                    "btc_macd_hist_4h": m.btc_macd_hist_4h,
+                },
+            )
+
 
         # 4) LOAN_VALUE (corrected logic)
         btc_floor = 88000 if m.btc_rsi_1d > 35 else 90000
