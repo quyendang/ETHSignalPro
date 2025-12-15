@@ -22,7 +22,7 @@ load_dotenv()
 # =============================
 APP_TITLE = os.getenv("APP_TITLE", "ETHSignalPro")
 PORT = int(os.getenv("PORT", "8000"))
-REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "60"))
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "600"))
 
 # Notifications
 PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "").strip()
@@ -44,6 +44,8 @@ MAX_LOAN_PCT_NAV = float(os.getenv("MAX_LOAN_PCT_NAV", "0.25") or 0.25)
 
 # Cooldown
 SELL_COOLDOWN_SECONDS = int(os.getenv("SELL_COOLDOWN_SECONDS", "14400"))  # 4h
+BUY_COOLDOWN_SECONDS = int(os.getenv("BUY_COOLDOWN_SECONDS", "14400"))   # 6h
+LOAN_COOLDOWN_SECONDS = int(os.getenv("LOAN_COOLDOWN_SECONDS", "21600")) # 12h
 
 # =============================
 # Utilities
@@ -224,7 +226,7 @@ def pushover_notify(title: str, message: str):
         "title": title,
         "message": message,
         "priority": 0,
-        "sound": "cash",
+        "sound": "testeeee",
     }
     if PUSHOVER_DEVICE:
         data["device"] = PUSHOVER_DEVICE
@@ -266,6 +268,7 @@ class MarketSnapshot:
     eth_bb_mid_4h: float
     eth_bb_upper_4h: float
     eth_ma200_1d: float
+    btc_ema200_4h: float
 
 @dataclass
 class Signal:
@@ -277,6 +280,12 @@ class Signal:
 class StrategyEngine:
     def __init__(self):
         self.last_sell_ts: Optional[int] = None
+        self.last_action_ts: Dict[str, int] = {}
+
+
+    def _action_in_cooldown(self, action: str, now_ts: int, cooldown: int) -> bool:
+        last = self.last_action_ts.get(action)
+        return last is not None and (now_ts - last) < cooldown
 
     def _in_cooldown(self, now_ts: int) -> bool:
         if self.last_sell_ts is None:
@@ -350,35 +359,49 @@ class StrategyEngine:
             (m.eth_price <= m.eth_bb_lower_4h * 1.01)
         )
         
-        # BTC safety: không buyback khi BTC đang breakdown mạnh
-        btc_breakdown = (m.btc_macd_hist_4h < 0) and (m.btc_rsi_4h < 30)
+        btc_breakdown = (
+            (m.btc_rsi_4h < 28) and
+            (m.btc_macd_hist_4h < 0) and
+            (m.btc_price < m.btc_ema200_4h)
+        )
         
         if buyback_ok and not btc_breakdown:
+            if self._action_in_cooldown("BUYBACK", now_ts, BUY_COOLDOWN_SECONDS):
+                return Signal(
+                    action="HOLD",
+                    confidence="low",
+                    message="Đang trong cooldown BUYBACK để tránh spam.",
+                    meta={"cooldown_seconds": BUY_COOLDOWN_SECONDS},
+                )
+            
+            self.last_action_ts["BUYBACK"] = now_ts
             return Signal(
                 action="BUYBACK",
                 confidence="med",
-                message=f"Vùng mua lại: ETH {m.eth_price:.0f} vào hỗ trợ/BB lower và BTC không breakdown mạnh. Ưu tiên mua lại phần đã bán.",
+                message=f"Vùng mua lại: ETH {m.eth_price:.0f} vào hỗ trợ/BB lower và BTC không breakdown. Ưu tiên mua lại phần đã bán.",
                 meta={
                     "buy_zones": {"hard1": hard_buy1, "hard2": hard_buy2, "bb_lower": round(m.eth_bb_lower_4h)},
                     "eth_rsi_4h": m.eth_rsi_4h,
-                    "btc_price": m.btc_price,
+                    "btc_rsi_4h": m.btc_rsi_4h,
+                    "btc_ema200_4h": round(m.btc_ema200_4h),
                     "btc_breakdown": btc_breakdown,
                 },
             )
         
-        # Nếu ETH vào vùng mua nhưng BTC đang breakdown -> WAIT
         if buyback_ok and btc_breakdown:
             return Signal(
                 action="HOLD",
                 confidence="med",
-                message=f"ETH vào vùng mua ({m.eth_price:.0f}) nhưng BTC đang breakdown ({m.btc_price:.0f}). Không buyback, chờ BTC ổn định.",
+                message=f"ETH vào vùng mua ({m.eth_price:.0f}) nhưng BTC đang breakdown (RSI4H {m.btc_rsi_4h:.1f} & dưới EMA200 4H). Chờ ổn định rồi mới buyback.",
                 meta={
                     "eth_price": m.eth_price,
                     "btc_price": m.btc_price,
                     "btc_rsi_4h": m.btc_rsi_4h,
                     "btc_macd_hist_4h": m.btc_macd_hist_4h,
+                    "btc_ema200_4h": m.btc_ema200_4h,
                 },
             )
+
 
 
         # 4) LOAN_VALUE (corrected logic)
@@ -392,7 +415,10 @@ class StrategyEngine:
             cap_by_nav = nav_usdt * MAX_LOAN_PCT_NAV
             loan_amt = max(0.0, min(MAX_LOAN_USDT, cap_by_nav))
             loan_amt *= 0.6  # conservative for value mode
-
+            if self._action_in_cooldown("LOAN_VALUE", now_ts, LOAN_COOLDOWN_SECONDS):
+                return Signal(action="HOLD", ...)
+            
+            self.last_action_ts["LOAN_VALUE"] = now_ts
             return Signal(
                 action="LOAN_VALUE",
                 confidence="med",
@@ -520,6 +546,7 @@ class ETHSignalPro:
             eth_bb_mid_4h=float(o["ethusdt"]["4h"]["indicators"]["bb_mid"]),
             eth_bb_upper_4h=float(o["ethusdt"]["4h"]["indicators"]["bb_upper"]),
             eth_ma200_1d=float(o["ethusdt"]["1d"]["indicators"]["ema200"]),
+            btc_ema200_4h=float(o["btcusdt"]["4h"]["indicators"]["ema200"]),
         )
 
         sig = self.engine.decide(m, self.position)
