@@ -414,10 +414,16 @@ class StrategyEngine:
             nav_usdt = spot_eth * m.eth_price
             cap_by_nav = nav_usdt * MAX_LOAN_PCT_NAV
             loan_amt = max(0.0, min(MAX_LOAN_USDT, cap_by_nav))
-            loan_amt *= 0.6  # conservative for value mode
+            loan_amt *= 0.6  # conservative for value mode\
+
             if self._action_in_cooldown("LOAN_VALUE", now_ts, LOAN_COOLDOWN_SECONDS):
-                return Signal(action="HOLD", ...)
-            
+                return Signal(
+                    action="HOLD",
+                    confidence="low",
+                    message="Đang trong cooldown BUYBACK để tránh spam.",
+                    meta={"cooldown_seconds": BUY_COOLDOWN_SECONDS},
+                )
+                
             self.last_action_ts["LOAN_VALUE"] = now_ts
             return Signal(
                 action="LOAN_VALUE",
@@ -444,6 +450,16 @@ class StrategyEngine:
             cap_by_nav = nav_usdt * MAX_LOAN_PCT_NAV
             loan_amt = max(0.0, min(MAX_LOAN_USDT, cap_by_nav))
             loan_amt *= 0.5
+
+            if self._action_in_cooldown("LOAN_MOMENTUM", now_ts, LOAN_COOLDOWN_SECONDS):
+                return Signal(
+                    action="HOLD",
+                    confidence="low",
+                    message="Đang trong cooldown BUYBACK để tránh spam.",
+                    meta={"cooldown_seconds": BUY_COOLDOWN_SECONDS},
+                )
+                
+            self.last_action_ts["LOAN_MOMENTUM"] = now_ts
 
             return Signal(
                 action="LOAN_MOMENTUM",
