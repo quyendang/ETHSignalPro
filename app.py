@@ -25,6 +25,11 @@ from sqlalchemy.orm import declarative_base, Mapped, mapped_column, sessionmaker
 # Settings
 # -----------------------------
 class Settings(BaseSettings):
+    PUSHOVER_TOKEN: str = os.environ.get("PUSHOVER_TOKEN", "")
+    PUSHOVER_USER: str = os.environ.get("PUSHOVER_USER", "")
+    PUSHOVER_DEVICE: str = os.environ.get("PUSHOVER_DEVICE", "")
+    PUSHOVER_SOUND: str = os.environ.get("PUSHOVER_SOUND", "cash")
+
     DATABASE_URL: str = os.environ.get(
         "DATABASE_URL",
         "postgres://koyeb-adm:*******@ep-aged-bush-a1op42oy.ap-southeast-1.pg.koyeb.app/koyebdb"
@@ -547,27 +552,40 @@ def decide_signal(m: Market, position: Dict[str, Any]) -> Signal:
 # -----------------------------
 # Telegram Notify
 # -----------------------------
-async def send_telegram(text: str):
-    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+async def send_pushover(title: str, message: str):
+    if not settings.PUSHOVER_TOKEN or not settings.PUSHOVER_USER:
         return
-    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    data = {
+        "token": settings.PUSHOVER_TOKEN,
+        "user": settings.PUSHOVER_USER,
+        "title": title,
+        "message": message,
+        "priority": 0,
+        "sound": settings.PUSHOVER_SOUND or "cash",
+    }
+    if settings.PUSHOVER_DEVICE:
+        data["device"] = settings.PUSHOVER_DEVICE
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(url, json=payload)
+            await client.post("https://api.pushover.net/1/messages.json", data=data)
     except Exception as e:
-        log.warning("Telegram notify failed: %s", e)
+        log.warning("Pushover notify failed: %s", e)
 
 
-def format_signal_message(sig: Signal, m: Market) -> str:
-    return (
-        f"🧠 SafeBorrowBot\n"
-        f"Action: {sig.action} ({sig.confidence})\n"
-        f"ETH: {m.eth_price:.2f} | BTC: {m.btc_price:.2f} | ETHBTC: {m.ethbtc_price:.6f}\n"
+def format_pushover(sig: "Signal", m: "Market") -> tuple[str, str]:
+    title = f"{sig.action} ({sig.confidence}) | ETH {m.eth_price:.0f}"
+    msg = (
+        f"{sig.message}\n\n"
+        f"ETH: {m.eth_price:.2f}\n"
+        f"BTC: {m.btc_price:.2f}\n"
+        f"ETHBTC: {m.ethbtc_price:.6f}\n"
         f"ETH RSI4H: {m.eth_rsi_4h:.2f} | BTC RSI4H: {m.btc_rsi_4h:.2f}\n"
         f"BTC breakdown: {m.btc_breakdown} | BTC rebound: {m.btc_rebound}\n"
-        f"Msg: {sig.message}"
+        f"Time: {m.time.isoformat()}"
     )
+    return title, msg
+
 
 
 # -----------------------------
@@ -841,7 +859,8 @@ async def poll_once():
                 await update_emit_state(session, sig.action, m.eth_price)
 
                 log.info("EMIT %s | ETH %.2f | BTC %.2f", sig.action, m.eth_price, m.btc_price)
-                await send_telegram(format_signal_message(sig, m))
+                title, msg = format_pushover(sig, m)
+                await send_pushover(title, msg)
             else:
                 log.info("SKIP (cooldown) %s | ETH %.2f", sig.action, m.eth_price)
 
