@@ -1,9 +1,8 @@
 fastapi
 uvicorn[standard]
 httpx
-pandas
+sqlalchemy
+asyncpg
+pydantic
+pydantic-settings
 numpy
-python-dotenv
-apscheduler
-python-multipart
-psycopg[binary]
