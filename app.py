@@ -1,264 +1,339 @@
 import os
 import math
-import json
-import time
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Literal, Dict, Any, List, Tuple
 
-import numpy as np
-import pandas as pd
 import httpx
-import psycopg
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
-from apscheduler.schedulers.background import BackgroundScheduler
-from dotenv import load_dotenv
+import numpy as np
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings
 
-load_dotenv()
+from sqlalchemy import (
+    String, Float, Integer, DateTime, JSON, select, UniqueConstraint
+)
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column, sessionmaker
 
-# =============================
-# Config
-# =============================
-APP_TITLE = os.getenv("APP_TITLE", "ETHSignalPro")
-PORT = int(os.getenv("PORT", "8000"))
-REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "600"))
 
-# Notifications
-PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "").strip()
-PUSHOVER_USER = os.getenv("PUSHOVER_USER", "").strip()
-PUSHOVER_DEVICE = os.getenv("PUSHOVER_DEVICE", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# -----------------------------
+# Settings
+# -----------------------------
+class Settings(BaseSettings):
+    DATABASE_URL: str = os.environ.get(
+        "DATABASE_URL",
+        "postgres://koyeb-adm:*******@ep-aged-bush-a1op42oy.ap-southeast-1.pg.koyeb.app/koyebdb"
+    )
 
-# Koyeb Postgres
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+    POLL_SECONDS: int = int(os.environ.get("POLL_SECONDS", "60"))
+    SIGNAL_COOLDOWN_MINUTES: int = int(os.environ.get("SIGNAL_COOLDOWN_MINUTES", "10"))
+    MIN_PRICE_MOVE_PCT: float = float(os.environ.get("MIN_PRICE_MOVE_PCT", "0.15"))  # %
 
-# Position (for personalization)
-SPOT_ETH = float(os.getenv("SPOT_ETH", "100") or 0)
-AVG_ENTRY = float(os.getenv("AVG_ENTRY", "3150") or 0)
+    LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
 
-# Loan sizing limits (suggestion only)
-MAX_LOAN_USDT = float(os.getenv("MAX_LOAN_USDT", "0") or 0)
-MAX_LOAN_PCT_NAV = float(os.getenv("MAX_LOAN_PCT_NAV", "0.25") or 0.25)
+    # Telegram notify (optional)
+    TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Cooldown
-SELL_COOLDOWN_SECONDS = int(os.getenv("SELL_COOLDOWN_SECONDS", "14400"))  # 4h
-BUY_COOLDOWN_SECONDS = int(os.getenv("BUY_COOLDOWN_SECONDS", "14400"))   # 6h
-LOAN_COOLDOWN_SECONDS = int(os.getenv("LOAN_COOLDOWN_SECONDS", "21600")) # 12h
+    # Strategy thresholds
+    ETH_RSI_BUY_SPOT: float = 32.0
+    ETH_RSI_BORROW_MIN: float = 35.0
+    BTC_RSI_PANIC: float = 25.0
 
-# =============================
-# Utilities
-# =============================
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    EMA_FAST: int = 34
+    EMA_SLOW: int = 200
 
-def sanitize_for_json(x: Any) -> Any:
-    if isinstance(x, float):
-        if math.isnan(x) or math.isinf(x):
-            return None
-        return x
-    if isinstance(x, (np.floating,)):
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return None
-        return v
-    if isinstance(x, dict):
-        return {k: sanitize_for_json(v) for k, v in x.items()}
-    if isinstance(x, list):
-        return [sanitize_for_json(v) for v in x]
-    return x
+    BACKTEST_LOOKAHEAD_BARS: int = 6  # 6*4H = 24h
 
-# =============================
-# Indicators
-# =============================
-def ema(series: np.ndarray, span: int) -> np.ndarray:
-    return pd.Series(series).ewm(span=span, adjust=False).mean().to_numpy()
+settings = Settings()
 
-def rsi(series: np.ndarray, period: int = 14) -> float:
-    s = pd.Series(series)
-    delta = s.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    out = 100 - (100 / (1 + rs))
-    v = out.iloc[-1]
-    return float(v) if pd.notna(v) else float("nan")
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("safe-borrow-bot")
 
-def macd_hist(series: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float]:
-    s = pd.Series(series)
-    ema_fast = s.ewm(span=fast, adjust=False).mean()
-    ema_slow = s.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(hist.iloc[-1])
 
-def bollinger(series: np.ndarray, period: int = 20, k: float = 2.0) -> Tuple[float, float, float]:
-    s = pd.Series(series)
-    mid = s.rolling(period).mean().iloc[-1]
-    std = s.rolling(period).std(ddof=0).iloc[-1]
-    if pd.isna(mid) or pd.isna(std):
-        return float("nan"), float("nan"), float("nan")
-    lower = float(mid - k * std)
-    upper = float(mid + k * std)
-    return float(lower), float(mid), float(upper)
+# -----------------------------
+# DB setup
+# -----------------------------
+Base = declarative_base()
 
-# =============================
-# Bybit Public Client (no API key)
-# =============================
-class BybitPublic:
-    BASE = "https://api.bybit.com"
-    INTERVAL_MAP = {
-        "1h": "60",
-        "4h": "240",
-        "1d": "D",
-    }
 
-    def __init__(self):
-        self._client = httpx.Client(timeout=20.0)
+def _to_asyncpg_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    if url.startswith("postgresql://") and not url.startswith("postgresql+asyncpg://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
 
-    def close(self):
-        self._client.close()
 
-    def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        url = self.BASE + path
-        r = self._client.get(url, params=params)
+engine = create_async_engine(_to_asyncpg_url(settings.DATABASE_URL), pool_pre_ping=True)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+class MarketSnapshot(Base):
+    __tablename__ = "market_snapshots"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    eth_price: Mapped[float] = mapped_column(Float)
+    btc_price: Mapped[float] = mapped_column(Float)
+    ethbtc_price: Mapped[float] = mapped_column(Float)
+
+    eth_rsi_4h: Mapped[float] = mapped_column(Float)
+    btc_rsi_4h: Mapped[float] = mapped_column(Float)
+    ethbtc_rsi_4h: Mapped[float] = mapped_column(Float)
+
+    eth_macd_hist_4h: Mapped[float] = mapped_column(Float)
+    btc_macd_hist_4h: Mapped[float] = mapped_column(Float)
+    ethbtc_macd_hist_4h: Mapped[float] = mapped_column(Float)
+
+    eth_bb_lower_4h: Mapped[float] = mapped_column(Float)
+    eth_bb_mid_4h: Mapped[float] = mapped_column(Float)
+    eth_bb_upper_4h: Mapped[float] = mapped_column(Float)
+
+    btc_ema34_4h: Mapped[float] = mapped_column(Float)
+    btc_ema200_4h: Mapped[float] = mapped_column(Float)
+    btc_breakdown: Mapped[bool] = mapped_column(Integer)  # 0/1
+
+
+class SignalLog(Base):
+    __tablename__ = "signal_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    confidence: Mapped[str] = mapped_column(String(16))
+    message: Mapped[str] = mapped_column(String(500))
+    meta: Mapped[dict] = mapped_column(JSON)
+
+    eth_price: Mapped[float] = mapped_column(Float)
+    btc_price: Mapped[float] = mapped_column(Float)
+    ethbtc_price: Mapped[float] = mapped_column(Float)
+
+
+class AlertState(Base):
+    __tablename__ = "alert_state"
+    __table_args__ = (UniqueConstraint("key", name="uq_alert_state_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    last_sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_sent_price: Mapped[float] = mapped_column(Float)
+
+
+# -----------------------------
+# Templates (dashboard)
+# -----------------------------
+templates = Jinja2Templates(directory="templates")
+
+DASHBOARD_HTML = """\
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Safe Borrow Bot Dashboard</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui; margin:20px; background:#0b0f14; color:#e6edf3;}
+    .row{display:flex; gap:14px; flex-wrap:wrap;}
+    .card{background:#111824; border:1px solid #1f2a3a; border-radius:12px; padding:14px; min-width:280px;}
+    .muted{color:#9fb1c3}
+    table{width:100%; border-collapse:collapse;}
+    th,td{padding:10px; border-bottom:1px solid #1f2a3a; font-size:14px;}
+    .badge{padding:4px 8px; border-radius:999px; border:1px solid #2a3a52; display:inline-block}
+    .buy{background:rgba(46,204,113,.12); border-color:rgba(46,204,113,.35)}
+    .risk{background:rgba(231,76,60,.12); border-color:rgba(231,76,60,.35)}
+    .hold{background:rgba(149,165,166,.10); border-color:rgba(149,165,166,.25)}
+    a{color:#7cc2ff}
+  </style>
+</head>
+<body>
+  <h2>Safe Borrow Bot Dashboard</h2>
+  <div class="muted">Auto refresh mỗi 30s. <a href="/api/signals?limit=50">API signals</a> | <a href="/api/market/latest">API market</a></div>
+  <script>
+    setTimeout(()=>location.reload(), 30000);
+  </script>
+
+  <div class="row" style="margin-top:14px">
+    <div class="card">
+      <div class="muted">Latest Market</div>
+      <div style="font-size:22px; margin-top:6px;">ETH: {{market.eth_price}} | BTC: {{market.btc_price}}</div>
+      <div class="muted" style="margin-top:6px;">ETHBTC: {{market.ethbtc_price}}</div>
+      <div style="margin-top:10px;">
+        <div>ETH RSI4H: <b>{{market.eth_rsi_4h}}</b> | BTC RSI4H: <b>{{market.btc_rsi_4h}}</b></div>
+        <div class="muted">BTC breakdown: <b>{{market.btc_breakdown}}</b></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="muted">Latest Signal</div>
+      <div style="margin-top:8px;">
+        <span class="badge {{sig_class}}">{{signal.action}} ({{signal.confidence}})</span>
+      </div>
+      <div style="margin-top:10px;">{{signal.message}}</div>
+      <div class="muted" style="margin-top:10px;">{{signal.time}}</div>
+    </div>
+
+    <div class="card">
+      <div class="muted">Position</div>
+      <div style="margin-top:8px;">spot_eth: <b>{{pos.spot_eth}}</b></div>
+      <div>loan_usdt: <b>{{pos.loan_usdt}}</b></div>
+      <div>avg_entry: <b>{{pos.avg_entry}}</b></div>
+      <div class="muted" style="margin-top:8px;">Update via POST /position</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="muted">Recent signals</div>
+    <table style="margin-top:10px">
+      <thead>
+        <tr>
+          <th>Time</th><th>Action</th><th>ETH</th><th>BTC</th><th>Message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in signals %}
+        <tr>
+          <td class="muted">{{s.time}}</td>
+          <td><span class="badge {% if 'BORROW' in s.action or 'BUY' in s.action %}buy{% elif s.action=='REDUCE_RISK' %}risk{% else %}hold{% endif %}">{{s.action}}</span></td>
+          <td>{{s.eth_price}}</td>
+          <td>{{s.btc_price}}</td>
+          <td class="muted">{{s.message}}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+</body>
+</html>
+"""
+
+
+# -----------------------------
+# Binance helpers
+# -----------------------------
+BINANCE = "https://api.binance.com"
+
+
+async def fetch_klines(symbol: str, interval: str, limit: int = 300) -> np.ndarray:
+    url = f"{BINANCE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 300) -> List[Dict[str, Any]]:
-        iv = self.INTERVAL_MAP.get(interval)
-        if not iv:
-            raise ValueError(f"Unsupported interval: {interval}")
+    closes = np.array([float(x[4]) for x in data], dtype=np.float64)
+    highs = np.array([float(x[2]) for x in data], dtype=np.float64)
+    lows = np.array([float(x[3]) for x in data], dtype=np.float64)
+    return np.vstack([closes, highs, lows])
 
-        data = self._get(
-            "/v5/market/kline",
-            {
-                "category": "spot",
-                "symbol": symbol,
-                "interval": iv,
-                "limit": limit,
-            },
-        )
 
-        rows = data.get("result", {}).get("list", [])
-        candles = []
-        for row in rows:
-            ts_ms = int(row[0])
-            candles.append(
-                {
-                    "timestamp": ts_ms,
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5]),
-                }
-            )
+# -----------------------------
+# Indicators
+# -----------------------------
+def ema(series: np.ndarray, period: int) -> np.ndarray:
+    if len(series) < period + 2:
+        return np.full_like(series, np.nan)
+    alpha = 2 / (period + 1)
+    out = np.empty_like(series, dtype=np.float64)
+    out[:] = np.nan
+    out[period - 1] = np.mean(series[:period])
+    for i in range(period, len(series)):
+        out[i] = alpha * series[i] + (1 - alpha) * out[i - 1]
+    return out
 
-        candles.sort(key=lambda x: x["timestamp"])
-        return candles
 
-# =============================
-# DB (Koyeb Postgres)
-# =============================
-def db_init():
-    if not DATABASE_URL:
-        print("[DB] DATABASE_URL not set -> DB logging disabled")
-        return
-    try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS signals (
-                    id BIGSERIAL PRIMARY KEY,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    action TEXT NOT NULL,
-                    confidence TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    meta JSONB,
-                    market JSONB,
-                    position JSONB
-                );
-                """)
-                conn.commit()
-        print("[DB] init ok")
-    except Exception as e:
-        print(f"[DB] init error: {e}")
+def rsi(series: np.ndarray, period: int = 14) -> np.ndarray:
+    if len(series) < period + 2:
+        return np.full_like(series, np.nan)
+    delta = np.diff(series, prepend=series[0])
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
 
-def db_log_signal(payload: Dict[str, Any]):
-    if not DATABASE_URL:
-        return
-    try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO signals (created_at, action, confidence, message, meta, market, position)
-                    VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb);
-                    """,
-                    (
-                        payload.get("created_at"),
-                        payload.get("action"),
-                        payload.get("confidence"),
-                        payload.get("message"),
-                        json.dumps(payload.get("meta", {}), ensure_ascii=False),
-                        json.dumps(payload.get("market", {}), ensure_ascii=False),
-                        json.dumps(payload.get("position", {}), ensure_ascii=False),
-                    ),
-                )
-                conn.commit()
-    except Exception as e:
-        print(f"[DB] insert error: {e}")
+    avg_gain = np.empty_like(series, dtype=np.float64)
+    avg_loss = np.empty_like(series, dtype=np.float64)
+    avg_gain[:] = np.nan
+    avg_loss[:] = np.nan
 
-# =============================
-# Notifications
-# =============================
-def pushover_notify(title: str, message: str):
-    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
-        return
-    data = {
-        "token": PUSHOVER_TOKEN,
-        "user": PUSHOVER_USER,
-        "title": title,
-        "message": message,
-        "priority": 0,
-        "sound": "testeeee",
-    }
-    if PUSHOVER_DEVICE:
-        data["device"] = PUSHOVER_DEVICE
-    try:
-        httpx.post("https://api.pushover.net/1/messages.json", data=data, timeout=15.0)
-    except Exception:
-        pass
+    avg_gain[period] = np.mean(gain[1:period+1])
+    avg_loss[period] = np.mean(loss[1:period+1])
 
-def telegram_notify(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        httpx.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15.0)
-    except Exception:
-        pass
+    for i in range(period + 1, len(series)):
+        avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain[i]) / period
+        avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss[i]) / period
 
-# =============================
-# State + Strategy
-# =============================
+    rs = avg_gain / (avg_loss + 1e-12)
+    out = 100 - (100 / (1 + rs))
+    return out
+
+
+def macd_hist(series: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> np.ndarray:
+    ef = ema(series, fast)
+    es = ema(series, slow)
+    macd_line = ef - es
+    sig = ema(macd_line[~np.isnan(macd_line)], signal)
+    sig_aligned = np.full_like(macd_line, np.nan)
+    sig_aligned[-len(sig):] = sig
+    hist = macd_line - sig_aligned
+    return hist
+
+
+def bollinger(series: np.ndarray, period: int = 20, mult: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(series) < period:
+        nan = np.full_like(series, np.nan)
+        return nan, nan, nan
+    mid = np.full_like(series, np.nan)
+    upper = np.full_like(series, np.nan)
+    lower = np.full_like(series, np.nan)
+    for i in range(period - 1, len(series)):
+        window = series[i - period + 1:i + 1]
+        m = window.mean()
+        s = window.std(ddof=0)
+        mid[i] = m
+        upper[i] = m + mult * s
+        lower[i] = m - mult * s
+    return lower, mid, upper
+
+
+def is_macd_hist_rising(hist: np.ndarray, bars: int = 3) -> bool:
+    h = hist[~np.isnan(hist)]
+    if len(h) < bars + 1:
+        return False
+    last = h[-(bars+1):]
+    return all(last[i] < last[i + 1] for i in range(len(last) - 1))
+
+
+def pct_change(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
+
+
+# -----------------------------
+# Strategy
+# -----------------------------
+SignalAction = Literal["HOLD", "BUY_SPOT", "BUYBACK", "BORROW_BUY", "REDUCE_RISK"]
+
+
 @dataclass
-class MarketSnapshot:
+class Market:
+    time: datetime
     eth_price: float
     btc_price: float
     ethbtc_price: float
 
     eth_rsi_4h: float
-    eth_rsi_1d: float
     btc_rsi_4h: float
-    btc_rsi_1d: float
     ethbtc_rsi_4h: float
-    ethbtc_rsi_1d: float
 
     eth_macd_hist_4h: float
     btc_macd_hist_4h: float
@@ -267,461 +342,521 @@ class MarketSnapshot:
     eth_bb_lower_4h: float
     eth_bb_mid_4h: float
     eth_bb_upper_4h: float
-    eth_ma200_1d: float
-    btc_ema200_4h: float
 
-@dataclass
-class Signal:
-    action: str          # HOLD / SELL_ROTATE / BUYBACK / LOAN_VALUE / LOAN_MOMENTUM / REPAY
-    confidence: str      # low/med/high
+    btc_ema34_4h: float
+    btc_ema200_4h: float
+    btc_breakdown: bool
+
+    eth_macd_hist_rising: bool
+    btc_rebound: bool
+    ethbtc_no_lower_low: bool
+
+
+class Signal(BaseModel):
+    action: SignalAction
+    confidence: Literal["low", "med", "high"]
     message: str
     meta: Dict[str, Any]
 
-class StrategyEngine:
-    def __init__(self):
-        self.last_sell_ts: Optional[int] = None
-        self.last_action_ts: Dict[str, int] = {}
+
+def detect_higher_low(closes: np.ndarray, lookback: int = 30) -> bool:
+    x = closes[-lookback:]
+    if len(x) < 10:
+        return False
+    mins = []
+    for i in range(2, len(x) - 2):
+        if x[i] < x[i-1] and x[i] < x[i+1] and x[i] < x[i-2] and x[i] < x[i+2]:
+            mins.append((i, x[i]))
+    if len(mins) < 2:
+        return False
+    (_, low1), (_, low2) = mins[-2], mins[-1]
+    return low2 > low1
 
 
-    def _action_in_cooldown(self, action: str, now_ts: int, cooldown: int) -> bool:
-        last = self.last_action_ts.get(action)
-        return last is not None and (now_ts - last) < cooldown
-
-    def _in_cooldown(self, now_ts: int) -> bool:
-        if self.last_sell_ts is None:
-            return False
-        return (now_ts - self.last_sell_ts) < SELL_COOLDOWN_SECONDS
-
-    def decide(self, m: MarketSnapshot, position: Dict[str, Any]) -> Signal:
-        spot_eth = float(position.get("spot_eth", SPOT_ETH))
-        loan_usdt = float(position.get("loan_usdt", 0.0))
-        avg_entry = float(position.get("avg_entry", AVG_ENTRY))
-
-        now_ts = int(time.time())
-
-        # Dynamic anchors
-        bb_sell_zone = (m.eth_bb_upper_4h * 0.995, m.eth_bb_upper_4h * 1.02)
-        bb_buy_zone = (m.eth_bb_lower_4h, m.eth_bb_mid_4h)
-
-        # Extra “hard” zones to keep stable across months
-        hard_sell1 = (3350, 3450)
-        hard_sell2 = (3550, 3700)
-        hard_buy1 = (3000, 3050)
-        hard_buy2 = (2850, 2920)
-
-        # 1) REPAY (if already loaned)
-        if loan_usdt > 0:
-            if (m.eth_price > m.eth_bb_mid_4h) and (m.eth_rsi_4h >= 55):
-                return Signal(
-                    action="REPAY",
-                    confidence="med",
-                    message=f"ETH hồi đủ để trả nợ: giá {m.eth_price:.0f} > BB_mid {m.eth_bb_mid_4h:.0f}, RSI4H {m.eth_rsi_4h:.1f}. Ưu tiên chốt 1 phần giảm áp lực.",
-                    meta={
-                        "suggested_sell_eth": round(min(max(spot_eth * 0.08, 1.0), 10.0), 3),
-                        "loan_usdt": loan_usdt,
-                        "eth_price": m.eth_price,
-                    },
-                )
-
-        # 2) SELL_ROTATE (cooldown 4h)
-        if not self._in_cooldown(now_ts):
-            eth_at_resistance = (
-                (hard_sell1[0] <= m.eth_price <= hard_sell1[1]) or
-                (hard_sell2[0] <= m.eth_price <= hard_sell2[1]) or
-                (bb_sell_zone[0] <= m.eth_price <= bb_sell_zone[1])
-            )
-            ethbtc_not_strong = (m.ethbtc_rsi_4h <= 55) or (m.ethbtc_macd_hist_4h < 0)
-
-            if eth_at_resistance and ethbtc_not_strong and spot_eth > 0:
-                if spot_eth >= 120:
-                    sell_eth = 30
-                elif spot_eth >= 80:
-                    sell_eth = 20
-                else:
-                    sell_eth = spot_eth * 0.2
-
-                self.last_sell_ts = now_ts
-                return Signal(
-                    action="SELL_ROTATE",
-                    confidence="med",
-                    message=f"Vùng bán xoay vòng: ETH {m.eth_price:.0f} chạm kháng cự; ETHBTC chưa mạnh. Bán một phần chờ mua lại thấp.",
-                    meta={
-                        "sell_eth": round(sell_eth, 3),
-                        "sell_zones": {"hard1": hard_sell1, "hard2": hard_sell2, "bb": (round(bb_sell_zone[0]), round(bb_sell_zone[1]))},
-                        "ethbtc": m.ethbtc_price,
-                    },
-                )
-
-        # 3) BUYBACK
-        buyback_ok = (
-            (hard_buy1[0] <= m.eth_price <= hard_buy1[1]) or
-            (hard_buy2[0] <= m.eth_price <= hard_buy2[1]) or
-            (m.eth_price <= m.eth_bb_lower_4h * 1.01)
-        )
-        
-        btc_breakdown = (
-            (m.btc_rsi_4h < 28) and
-            (m.btc_macd_hist_4h < 0) and
-            (m.btc_price < m.btc_ema200_4h)
-        )
-        
-        if buyback_ok and not btc_breakdown:
-            if self._action_in_cooldown("BUYBACK", now_ts, BUY_COOLDOWN_SECONDS):
-                return Signal(
-                    action="HOLD",
-                    confidence="low",
-                    message="Đang trong cooldown BUYBACK để tránh spam.",
-                    meta={"cooldown_seconds": BUY_COOLDOWN_SECONDS},
-                )
-            
-            self.last_action_ts["BUYBACK"] = now_ts
-            return Signal(
-                action="BUYBACK",
-                confidence="med",
-                message=f"Vùng mua lại: ETH {m.eth_price:.0f} vào hỗ trợ/BB lower và BTC không breakdown. Ưu tiên mua lại phần đã bán.",
-                meta={
-                    "buy_zones": {"hard1": hard_buy1, "hard2": hard_buy2, "bb_lower": round(m.eth_bb_lower_4h)},
-                    "eth_rsi_4h": m.eth_rsi_4h,
-                    "btc_rsi_4h": m.btc_rsi_4h,
-                    "btc_ema200_4h": round(m.btc_ema200_4h),
-                    "btc_breakdown": btc_breakdown,
-                },
-            )
-        
-        if buyback_ok and btc_breakdown:
-            return Signal(
-                action="HOLD",
-                confidence="med",
-                message=f"ETH vào vùng mua ({m.eth_price:.0f}) nhưng BTC đang breakdown (RSI4H {m.btc_rsi_4h:.1f} & dưới EMA200 4H). Chờ ổn định rồi mới buyback.",
-                meta={
-                    "eth_price": m.eth_price,
-                    "btc_price": m.btc_price,
-                    "btc_rsi_4h": m.btc_rsi_4h,
-                    "btc_macd_hist_4h": m.btc_macd_hist_4h,
-                    "btc_ema200_4h": m.btc_ema200_4h,
-                },
-            )
+def detect_no_lower_low(closes: np.ndarray, lookback: int = 40) -> bool:
+    x = closes[-lookback:]
+    if len(x) < 10:
+        return True
+    lows = []
+    for i in range(2, len(x) - 2):
+        if x[i] < x[i-1] and x[i] < x[i+1]:
+            lows.append(x[i])
+    if len(lows) < 2:
+        return True
+    return lows[-1] >= lows[-2]
 
 
+def compute_market(eth_4h: np.ndarray, btc_4h: np.ndarray, ethbtc_4h: np.ndarray) -> Market:
+    now = datetime.now(timezone.utc)
 
-        # 4) LOAN_VALUE (corrected logic)
-        btc_floor = 88000 if m.btc_rsi_1d > 35 else 90000
-        eth_value_zone = (m.eth_price <= 3000) or (m.eth_price <= m.eth_bb_lower_4h * 1.01)
-        ethbtc_ok = (m.ethbtc_price >= 0.0325)  # don't require 0.0345 here
-        btc_ok = (m.btc_price >= btc_floor)
+    eth_close = eth_4h[0]
+    btc_close = btc_4h[0]
+    ethbtc_close = ethbtc_4h[0]
 
-        if loan_usdt <= 0 and MAX_LOAN_USDT > 0 and eth_value_zone and btc_ok and ethbtc_ok:
-            nav_usdt = spot_eth * m.eth_price
-            cap_by_nav = nav_usdt * MAX_LOAN_PCT_NAV
-            loan_amt = max(0.0, min(MAX_LOAN_USDT, cap_by_nav))
-            loan_amt *= 0.6  # conservative for value mode\
+    eth_price = float(eth_close[-1])
+    btc_price = float(btc_close[-1])
+    ethbtc_price = float(ethbtc_close[-1])
 
-            if self._action_in_cooldown("LOAN_VALUE", now_ts, LOAN_COOLDOWN_SECONDS):
-                return Signal(
-                    action="HOLD",
-                    confidence="low",
-                    message="Đang trong cooldown BUYBACK để tránh spam.",
-                    meta={"cooldown_seconds": BUY_COOLDOWN_SECONDS},
-                )
-                
-            self.last_action_ts["LOAN_VALUE"] = now_ts
-            return Signal(
-                action="LOAN_VALUE",
-                confidence="med",
-                message=f"VAY VALUE: ETH đang rẻ ({m.eth_price:.0f}), BTC không breakdown (>= {btc_floor:.0f}), ETHBTC không gãy đáy. Vay nhỏ để mua thêm.",
-                meta={
-                    "loan_usdt_suggested": round(loan_amt, 2),
-                    "btc_floor": btc_floor,
-                    "ethbtc": m.ethbtc_price,
-                    "nav_usdt": round(nav_usdt, 2),
-                    "max_pct_nav": MAX_LOAN_PCT_NAV,
-                },
-            )
+    eth_r = rsi(eth_close, 14)
+    btc_r = rsi(btc_close, 14)
+    ethbtc_r = rsi(ethbtc_close, 14)
 
-        # 5) LOAN_MOMENTUM (follow-through)
-        momentum_ok = (
-            (m.ethbtc_price > 0.0345) and
-            (m.ethbtc_rsi_4h >= 55) and
-            (m.btc_price >= 90000) and
-            (m.eth_price >= m.eth_bb_mid_4h)
-        )
-        if loan_usdt <= 0 and MAX_LOAN_USDT > 0 and momentum_ok:
-            nav_usdt = spot_eth * m.eth_price
-            cap_by_nav = nav_usdt * MAX_LOAN_PCT_NAV
-            loan_amt = max(0.0, min(MAX_LOAN_USDT, cap_by_nav))
-            loan_amt *= 0.5
+    eth_hist = macd_hist(eth_close)
+    btc_hist = macd_hist(btc_close)
+    ethbtc_hist = macd_hist(ethbtc_close)
 
-            if self._action_in_cooldown("LOAN_MOMENTUM", now_ts, LOAN_COOLDOWN_SECONDS):
-                return Signal(
-                    action="HOLD",
-                    confidence="low",
-                    message="Đang trong cooldown BUYBACK để tránh spam.",
-                    meta={"cooldown_seconds": BUY_COOLDOWN_SECONDS},
-                )
-                
-            self.last_action_ts["LOAN_MOMENTUM"] = now_ts
+    bb_l, bb_m, bb_u = bollinger(eth_close, 20, 2)
 
-            return Signal(
-                action="LOAN_MOMENTUM",
-                confidence="high",
-                message="VAY MOMENTUM: ETHBTC breakout > 0.0345 và ETH reclaim BB mid, BTC ổn. Có thể vay nhỏ để theo sóng.",
-                meta={
-                    "loan_usdt_suggested": round(loan_amt, 2),
-                    "ethbtc": m.ethbtc_price,
-                    "eth_price": m.eth_price,
-                    "btc_price": m.btc_price,
-                },
-            )
+    btc_ema34 = ema(btc_close, settings.EMA_FAST)
+    btc_ema200 = ema(btc_close, settings.EMA_SLOW)
+    btc_ema34_last = float(btc_ema34[-1]) if not math.isnan(btc_ema34[-1]) else float("nan")
+    btc_ema200_last = float(btc_ema200[-1]) if not math.isnan(btc_ema200[-1]) else float("nan")
 
+    btc_breakdown = bool((btc_price < btc_ema34_last) and (btc_ema34_last < btc_ema200_last))
+    btc_rebound = bool((btc_price > btc_ema34_last) or detect_higher_low(btc_close))
+
+    eth_hist_rising = is_macd_hist_rising(eth_hist, bars=3)
+    ethbtc_ok = detect_no_lower_low(ethbtc_close)
+
+    return Market(
+        time=now,
+        eth_price=eth_price,
+        btc_price=btc_price,
+        ethbtc_price=ethbtc_price,
+
+        eth_rsi_4h=float(eth_r[-1]),
+        btc_rsi_4h=float(btc_r[-1]),
+        ethbtc_rsi_4h=float(ethbtc_r[-1]),
+
+        eth_macd_hist_4h=float(eth_hist[-1]),
+        btc_macd_hist_4h=float(btc_hist[-1]),
+        ethbtc_macd_hist_4h=float(ethbtc_hist[-1]),
+
+        eth_bb_lower_4h=float(bb_l[-1]),
+        eth_bb_mid_4h=float(bb_m[-1]),
+        eth_bb_upper_4h=float(bb_u[-1]),
+
+        btc_ema34_4h=btc_ema34_last,
+        btc_ema200_4h=btc_ema200_last,
+        btc_breakdown=btc_breakdown,
+
+        eth_macd_hist_rising=eth_hist_rising,
+        btc_rebound=btc_rebound,
+        ethbtc_no_lower_low=ethbtc_ok
+    )
+
+
+def decide_signal(m: Market, position: Dict[str, Any]) -> Signal:
+    spot_eth = float(position.get("spot_eth", 0) or 0)
+    loan_usdt = float(position.get("loan_usdt", 0) or 0)
+    avg_entry = float(position.get("avg_entry", 0) or 0)
+
+    if spot_eth > 0:
+        collateral = spot_eth * m.eth_price
+        ltv = (loan_usdt / collateral * 100.0) if collateral > 0 else 0.0
+    else:
+        ltv = float(position.get("ltv_pct", 0) or 0)
+
+    in_buy_zone = (m.eth_price <= m.eth_bb_lower_4h * 1.01) or (m.eth_rsi_4h <= settings.ETH_RSI_BUY_SPOT)
+    btc_panic = m.btc_rsi_4h <= settings.BTC_RSI_PANIC
+    macro_risk = m.btc_breakdown or btc_panic
+
+    # BORROW_BUY (strict)
+    borrow_allowed = (ltv < 15.0)
+    eth_stable = (m.eth_rsi_4h >= settings.ETH_RSI_BORROW_MIN) and m.eth_macd_hist_rising
+    borrow_conditions = borrow_allowed and m.btc_rebound and (not m.btc_breakdown) and eth_stable and m.ethbtc_no_lower_low
+
+    if borrow_conditions and in_buy_zone:
         return Signal(
-            action="HOLD",
-            confidence="low",
-            message="Chưa có tín hiệu rõ. Ưu tiên giữ và chờ vùng support/resistance hoặc ETHBTC breakout.",
-            meta={"eth_price": m.eth_price, "btc_price": m.btc_price, "ethbtc": m.ethbtc_price},
+            action="BORROW_BUY",
+            confidence="high" if (not macro_risk) else "med",
+            message="BORROW_BUY (an toàn): ETH vùng mua + BTC rebound + ETH ổn định (RSI đủ & MACD hist tăng).",
+            meta={
+                "ltv_pct": round(ltv, 2),
+                "in_buy_zone": in_buy_zone,
+                "btc_rebound": m.btc_rebound,
+                "btc_breakdown": m.btc_breakdown,
+                "eth_stable": eth_stable,
+                "eth_macd_hist_rising": m.eth_macd_hist_rising,
+                "ethbtc_no_lower_low": m.ethbtc_no_lower_low,
+                "eth_bb_lower_4h": round(m.eth_bb_lower_4h, 2),
+                "eth_rsi_4h": round(m.eth_rsi_4h, 2),
+                "btc_rsi_4h": round(m.btc_rsi_4h, 2),
+                "btc_ema34_4h": round(m.btc_ema34_4h, 2) if not math.isnan(m.btc_ema34_4h) else None,
+                "btc_ema200_4h": round(m.btc_ema200_4h, 2) if not math.isnan(m.btc_ema200_4h) else None,
+            }
         )
 
-# =============================
-# Core Bot
-# =============================
-class ETHSignalPro:
-    def __init__(self):
-        self.client = BybitPublic()
-        self.engine = StrategyEngine()
-
-        self.position = {
-            "spot_eth": SPOT_ETH,
-            "loan_usdt": 0.0,
-            "avg_entry": AVG_ENTRY,
-        }
-
-        self.cache_ohlcv: Dict[str, Any] = {}
-        self.cache_market: Optional[MarketSnapshot] = None
-        self.cache_signal: Optional[Dict[str, Any]] = None
-        self.recent_signals: List[Dict[str, Any]] = []
-
-    def build_pair_tf(self, symbol: str, tf: str, limit: int = 300) -> Dict[str, Any]:
-        candles = self.client.get_klines(symbol, tf, limit=limit)
-        closes = np.array([c["close"] for c in candles], dtype=float)
-        latest = candles[-1] if candles else None
-
-        ema34_v = float(ema(closes, 34)[-1]) if len(closes) else float("nan")
-        ema89_v = float(ema(closes, 89)[-1]) if len(closes) else float("nan")
-        ema200_v = float(ema(closes, 200)[-1]) if len(closes) else float("nan")
-        rsi14_v = rsi(closes, 14) if len(closes) else float("nan")
-        macd_v, macd_sig_v, macd_hist_v = macd_hist(closes) if len(closes) else (float("nan"), float("nan"), float("nan"))
-        bb_l, bb_m, bb_u = bollinger(closes, 20, 2.0) if len(closes) else (float("nan"), float("nan"), float("nan"))
-
-        return {
-            "candles": candles,
-            "latest": latest,
-            "indicators": {
-                "ema34": ema34_v,
-                "ema89": ema89_v,
-                "ema200": ema200_v,
-                "rsi14": rsi14_v,
-                "macd": macd_v,
-                "macd_signal": macd_sig_v,
-                "macd_hist": macd_hist_v,
-                "bb_lower": bb_l,
-                "bb_mid": bb_m,
-                "bb_upper": bb_u,
-            },
-        }
-
-    def refresh(self):
-        pairs = {"ethusdt": "ETHUSDT", "btcusdt": "BTCUSDT", "ethbtc": "ETHBTC"}
-        tfs = ["4h", "1d"]
-
-        o: Dict[str, Any] = {}
-        for k, sym in pairs.items():
-            o[k] = {}
-            for tf in tfs:
-                o[k][tf] = self.build_pair_tf(sym, tf, limit=300)
-
-        eth_price = float(o["ethusdt"]["4h"]["latest"]["close"])
-        btc_price = float(o["btcusdt"]["4h"]["latest"]["close"])
-        ethbtc_price = float(o["ethbtc"]["4h"]["latest"]["close"])
-
-        m = MarketSnapshot(
-            eth_price=eth_price,
-            btc_price=btc_price,
-            ethbtc_price=ethbtc_price,
-
-            eth_rsi_4h=float(o["ethusdt"]["4h"]["indicators"]["rsi14"]),
-            eth_rsi_1d=float(o["ethusdt"]["1d"]["indicators"]["rsi14"]),
-            btc_rsi_4h=float(o["btcusdt"]["4h"]["indicators"]["rsi14"]),
-            btc_rsi_1d=float(o["btcusdt"]["1d"]["indicators"]["rsi14"]),
-            ethbtc_rsi_4h=float(o["ethbtc"]["4h"]["indicators"]["rsi14"]),
-            ethbtc_rsi_1d=float(o["ethbtc"]["1d"]["indicators"]["rsi14"]),
-
-            eth_macd_hist_4h=float(o["ethusdt"]["4h"]["indicators"]["macd_hist"]),
-            btc_macd_hist_4h=float(o["btcusdt"]["4h"]["indicators"]["macd_hist"]),
-            ethbtc_macd_hist_4h=float(o["ethbtc"]["4h"]["indicators"]["macd_hist"]),
-
-            eth_bb_lower_4h=float(o["ethusdt"]["4h"]["indicators"]["bb_lower"]),
-            eth_bb_mid_4h=float(o["ethusdt"]["4h"]["indicators"]["bb_mid"]),
-            eth_bb_upper_4h=float(o["ethusdt"]["4h"]["indicators"]["bb_upper"]),
-            eth_ma200_1d=float(o["ethusdt"]["1d"]["indicators"]["ema200"]),
-            btc_ema200_4h=float(o["btcusdt"]["4h"]["indicators"]["ema200"]),
+    # BUYBACK / BUY_SPOT
+    if spot_eth > 0 and in_buy_zone and (not m.btc_breakdown):
+        return Signal(
+            action="BUYBACK",
+            confidence="med" if macro_risk else "high",
+            message="BUYBACK: ETH về vùng mua lại, BTC chưa breakdown. Ưu tiên DCA nhẹ / mua lại phần đã bán.",
+            meta={
+                "ltv_pct": round(ltv, 2),
+                "in_buy_zone": in_buy_zone,
+                "eth_bb_lower_4h": round(m.eth_bb_lower_4h, 2),
+                "eth_rsi_4h": round(m.eth_rsi_4h, 2),
+                "btc_rsi_4h": round(m.btc_rsi_4h, 2),
+                "btc_breakdown": m.btc_breakdown,
+            }
         )
 
-        sig = self.engine.decide(m, self.position)
-        sig_obj = {
-            "time": utc_now_iso(),
-            "signal": asdict(sig),
-            "market": asdict(m),
-            "position": dict(self.position),
+    if spot_eth <= 0 and in_buy_zone and (not m.btc_breakdown):
+        return Signal(
+            action="BUY_SPOT",
+            confidence="med" if macro_risk else "high",
+            message="BUY_SPOT: ETH vào vùng mua (không vay).",
+            meta={
+                "in_buy_zone": in_buy_zone,
+                "eth_bb_lower_4h": round(m.eth_bb_lower_4h, 2),
+                "eth_rsi_4h": round(m.eth_rsi_4h, 2),
+                "btc_rsi_4h": round(m.btc_rsi_4h, 2),
+                "btc_breakdown": m.btc_breakdown,
+            }
+        )
+
+    if loan_usdt > 0 and m.btc_breakdown:
+        return Signal(
+            action="REDUCE_RISK",
+            confidence="high",
+            message="REDUCE_RISK: BTC breakdown trong khi đang vay → ưu tiên giảm rủi ro/giảm nợ, không tăng vị thế.",
+            meta={
+                "ltv_pct": round(ltv, 2),
+                "btc_breakdown": True,
+                "btc_rsi_4h": round(m.btc_rsi_4h, 2),
+                "eth_rsi_4h": round(m.eth_rsi_4h, 2),
+            }
+        )
+
+    return Signal(
+        action="HOLD",
+        confidence="low",
+        message="HOLD: Chưa có điều kiện rõ ràng cho vay/mua an toàn.",
+        meta={
+            "in_buy_zone": in_buy_zone,
+            "btc_rebound": m.btc_rebound,
+            "btc_breakdown": m.btc_breakdown,
+            "eth_macd_hist_rising": m.eth_macd_hist_rising,
+            "ethbtc_no_lower_low": m.ethbtc_no_lower_low,
         }
+    )
 
-        self.cache_ohlcv = o
-        self.cache_market = m
-        self.cache_signal = sig_obj
 
-        # Notify + DB log only when action != HOLD
-        if sig.action != "HOLD":
-            title = f"[ETHSignalPro] {sig.action} ({sig.confidence})"
-            msg = (
-                sig.message + "\n"
-                f"ETH: {m.eth_price:.0f} | BTC: {m.btc_price:.0f} | ETHBTC: {m.ethbtc_price:.5f}\n"
-                f"RSI4H(ETH/BTC/ETHBTC): {m.eth_rsi_4h:.1f}/{m.btc_rsi_4h:.1f}/{m.ethbtc_rsi_4h:.1f}"
-            )
-            pushover_notify(title, msg)
-            telegram_notify(f"{title}\n{msg}")
-
-            self.recent_signals.insert(0, sig_obj)
-            self.recent_signals = self.recent_signals[:50]
-
-            db_log_signal(
-                sanitize_for_json(
-                    {
-                        "created_at": utc_now_iso(),
-                        "action": sig.action,
-                        "confidence": sig.confidence,
-                        "message": sig.message,
-                        "meta": sig.meta,
-                        "market": asdict(m),
-                        "position": dict(self.position),
-                    }
-                )
-            )
-
-# =============================
-# FastAPI + Dashboard
-# =============================
-bot = ETHSignalPro()
-app = FastAPI(title=APP_TITLE)
-
-db_init()
-
-DASHBOARD_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>ETHSignalPro</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui; margin: 18px; }
-    .row { display: flex; gap: 14px; flex-wrap: wrap; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; min-width: 280px; }
-    .big { font-size: 22px; font-weight: 700; }
-    .muted { color: #666; }
-    pre { background: #fafafa; padding: 10px; border-radius: 10px; overflow: auto; }
-    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; background: white; cursor: pointer; }
-  </style>
-</head>
-<body>
-  <div class="row">
-    <div class="card">
-      <div class="big">ETHSignalPro</div>
-      <div class="muted" id="ts">loading...</div>
-      <div style="margin-top:10px;">
-        <button onclick="refresh()">Refresh</button>
-      </div>
-      <div class="muted" style="margin-top:10px;">
-        Endpoints: <a href="/signals">/signals</a> | <a href="/ohlcv">/ohlcv</a> | <a href="/api/recent">/api/recent</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="big" id="action">--</div>
-      <div class="muted" id="confidence">--</div>
-      <div style="margin-top:10px;" id="msg">--</div>
-    </div>
-
-    <div class="card">
-      <div class="big">Market</div>
-      <div id="market"></div>
-    </div>
-  </div>
-
-  <h3>Recent Signals</h3>
-  <pre id="recent">--</pre>
-
-  <script>
-    async function refresh() {
-      const r = await fetch('/signals');
-      const j = await r.json();
-
-      document.getElementById('ts').textContent = j.time || '';
-      document.getElementById('action').textContent = j.signal?.action || '--';
-      document.getElementById('confidence').textContent = j.signal?.confidence || '--';
-      document.getElementById('msg').textContent = j.signal?.message || '--';
-
-      const m = j.market || {};
-      document.getElementById('market').innerHTML =
-        `ETH: <b>${(m.eth_price||0).toFixed(0)}</b><br>` +
-        `BTC: <b>${(m.btc_price||0).toFixed(0)}</b><br>` +
-        `ETHBTC: <b>${(m.ethbtc_price||0).toFixed(5)}</b><br>` +
-        `<span class="muted">RSI4H ETH: ${(m.eth_rsi_4h||0).toFixed(1)} | BTC: ${(m.btc_rsi_4h||0).toFixed(1)} | ETHBTC: ${(m.ethbtc_rsi_4h||0).toFixed(1)}</span><br>` +
-        `<span class="muted">BB4H ETH: L ${(m.eth_bb_lower_4h||0).toFixed(0)} / M ${(m.eth_bb_mid_4h||0).toFixed(0)} / U ${(m.eth_bb_upper_4h||0).toFixed(0)}</span><br>` +
-        `<span class="muted">MA200 1D ETH: ${(m.eth_ma200_1d||0).toFixed(0)}</span>`;
-
-      const r2 = await fetch('/api/recent');
-      const j2 = await r2.json();
-      document.getElementById('recent').textContent = JSON.stringify(j2, null, 2);
-    }
-    refresh();
-    setInterval(refresh, 30000);
-  </script>
-</body>
-</html>
-"""
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return DASHBOARD_HTML
-
-@app.get("/ohlcv", response_class=JSONResponse)
-def api_ohlcv():
-    if not bot.cache_ohlcv:
-        bot.refresh()
-    return JSONResponse(content=sanitize_for_json({"time": utc_now_iso(), "data": bot.cache_ohlcv}))
-
-@app.get("/signals", response_class=JSONResponse)
-def api_signals():
-    if not bot.cache_signal:
-        bot.refresh()
-    return JSONResponse(content=sanitize_for_json(bot.cache_signal))
-
-@app.get("/api/recent", response_class=JSONResponse)
-def api_recent():
-    return JSONResponse(content=sanitize_for_json(bot.recent_signals))
-
-@app.get("/api/health", response_class=JSONResponse)
-def api_health():
-    return JSONResponse(content={"ok": True, "time": utc_now_iso()})
-
-# =============================
-# Scheduler
-# =============================
-scheduler = BackgroundScheduler()
-
-def _job():
+# -----------------------------
+# Telegram Notify
+# -----------------------------
+async def send_telegram(text: str):
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
     try:
-        bot.refresh()
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(url, json=payload)
     except Exception as e:
-        print(f"[refresh] error: {e}")
+        log.warning("Telegram notify failed: %s", e)
 
-scheduler.add_job(_job, "interval", seconds=REFRESH_SECONDS, max_instances=1, coalesce=True)
-scheduler.start()
+
+def format_signal_message(sig: Signal, m: Market) -> str:
+    return (
+        f"🧠 SafeBorrowBot\n"
+        f"Action: {sig.action} ({sig.confidence})\n"
+        f"ETH: {m.eth_price:.2f} | BTC: {m.btc_price:.2f} | ETHBTC: {m.ethbtc_price:.6f}\n"
+        f"ETH RSI4H: {m.eth_rsi_4h:.2f} | BTC RSI4H: {m.btc_rsi_4h:.2f}\n"
+        f"BTC breakdown: {m.btc_breakdown} | BTC rebound: {m.btc_rebound}\n"
+        f"Msg: {sig.message}"
+    )
+
+
+# -----------------------------
+# Anti-spam / cooldown
+# -----------------------------
+async def should_emit(session: AsyncSession, action: str, price: float) -> bool:
+    now = datetime.now(timezone.utc)
+    cooldown = timedelta(minutes=settings.SIGNAL_COOLDOWN_MINUTES)
+
+    q = select(AlertState).where(AlertState.key == action)
+    row = (await session.execute(q)).scalars().first()
+
+    if not row:
+        return True
+
+    time_since = now - row.last_sent_at
+    if time_since >= cooldown:
+        return True
+
+    move = abs(pct_change(price, row.last_sent_price))
+    if time_since >= timedelta(minutes=2) and move >= settings.MIN_PRICE_MOVE_PCT:
+        return True
+
+    return False
+
+
+async def update_emit_state(session: AsyncSession, action: str, price: float):
+    now = datetime.now(timezone.utc)
+    q = select(AlertState).where(AlertState.key == action)
+    row = (await session.execute(q)).scalars().first()
+    if not row:
+        row = AlertState(key=action, last_sent_at=now, last_sent_price=price)
+        session.add(row)
+    else:
+        row.last_sent_at = now
+        row.last_sent_price = price
+
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="Safe Borrow Bot (Koyeb Postgres + Telegram + Dashboard)")
+
+
+POSITION_STATE = {
+    "spot_eth": 100,
+    "loan_usdt": 30000,
+    "avg_entry": 3150
+}
+
+
+class PositionUpdate(BaseModel):
+    spot_eth: float = 0
+    loan_usdt: float = 0
+    avg_entry: float = 0
+
+
+@app.on_event("startup")
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # ensure templates dir exists even on Koyeb ephemeral fs
+    os.makedirs("templates", exist_ok=True)
+    with open("templates/dashboard.html", "w", encoding="utf-8") as f:
+        f.write(DASHBOARD_HTML)
+
+    asyncio.create_task(poller_loop())
+    log.info("Bot started. Polling every %s seconds.", settings.POLL_SECONDS)
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/position")
+async def get_position():
+    return POSITION_STATE
+
+
+@app.post("/position")
+async def set_position(pos: PositionUpdate):
+    POSITION_STATE["spot_eth"] = pos.spot_eth
+    POSITION_STATE["loan_usdt"] = pos.loan_usdt
+    POSITION_STATE["avg_entry"] = pos.avg_entry
+    return {"ok": True, "position": POSITION_STATE}
+
+
+@app.get("/api/market/latest")
+async def api_latest_market():
+    async with AsyncSessionLocal() as session:
+        q = select(MarketSnapshot).order_by(MarketSnapshot.time.desc()).limit(1)
+        row = (await session.execute(q)).scalars().first()
+        if not row:
+            return {"ok": True, "market": None}
+        return {
+            "ok": True,
+            "time": row.time.isoformat(),
+            "market": {
+                "eth_price": row.eth_price,
+                "btc_price": row.btc_price,
+                "ethbtc_price": row.ethbtc_price,
+                "eth_rsi_4h": row.eth_rsi_4h,
+                "btc_rsi_4h": row.btc_rsi_4h,
+                "ethbtc_rsi_4h": row.ethbtc_rsi_4h,
+                "eth_bb_lower_4h": row.eth_bb_lower_4h,
+                "eth_bb_mid_4h": row.eth_bb_mid_4h,
+                "eth_bb_upper_4h": row.eth_bb_upper_4h,
+                "btc_ema34_4h": row.btc_ema34_4h,
+                "btc_ema200_4h": row.btc_ema200_4h,
+                "btc_breakdown": bool(row.btc_breakdown),
+            }
+        }
+
+
+@app.get("/api/signals")
+async def api_signals(limit: int = Query(30, ge=1, le=200)):
+    async with AsyncSessionLocal() as session:
+        q = select(SignalLog).order_by(SignalLog.time.desc()).limit(limit)
+        rows = (await session.execute(q)).scalars().all()
+        return {
+            "ok": True,
+            "signals": [
+                {
+                    "time": r.time.isoformat(),
+                    "action": r.action,
+                    "confidence": r.confidence,
+                    "message": r.message,
+                    "meta": r.meta,
+                    "eth_price": r.eth_price,
+                    "btc_price": r.btc_price,
+                    "ethbtc_price": r.ethbtc_price,
+                }
+                for r in rows
+            ]
+        }
+
+
+@app.get("/api/signal/latest")
+async def api_latest_signal():
+    async with AsyncSessionLocal() as session:
+        q = select(SignalLog).order_by(SignalLog.time.desc()).limit(1)
+        row = (await session.execute(q)).scalars().first()
+        if not row:
+            return {"ok": True, "signal": None}
+        return {
+            "ok": True,
+            "time": row.time.isoformat(),
+            "signal": {
+                "action": row.action,
+                "confidence": row.confidence,
+                "message": row.message,
+                "meta": row.meta
+            },
+            "market": {
+                "eth_price": row.eth_price,
+                "btc_price": row.btc_price,
+                "ethbtc_price": row.ethbtc_price
+            }
+        }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    async with AsyncSessionLocal() as session:
+        q1 = select(MarketSnapshot).order_by(MarketSnapshot.time.desc()).limit(1)
+        mrow = (await session.execute(q1)).scalars().first()
+
+        q2 = select(SignalLog).order_by(SignalLog.time.desc()).limit(1)
+        srow = (await session.execute(q2)).scalars().first()
+
+        q3 = select(SignalLog).order_by(SignalLog.time.desc()).limit(20)
+        recent = (await session.execute(q3)).scalars().all()
+
+    market = {
+        "eth_price": round(mrow.eth_price, 2) if mrow else None,
+        "btc_price": round(mrow.btc_price, 2) if mrow else None,
+        "ethbtc_price": round(mrow.ethbtc_price, 6) if mrow else None,
+        "eth_rsi_4h": round(mrow.eth_rsi_4h, 2) if mrow else None,
+        "btc_rsi_4h": round(mrow.btc_rsi_4h, 2) if mrow else None,
+        "btc_breakdown": bool(mrow.btc_breakdown) if mrow else None,
+    }
+
+    signal = {
+        "time": srow.time.isoformat() if srow else None,
+        "action": srow.action if srow else "HOLD",
+        "confidence": srow.confidence if srow else "low",
+        "message": srow.message if srow else "Chưa có signal.",
+    }
+
+    sig_class = "hold"
+    if "BORROW" in signal["action"] or "BUY" in signal["action"]:
+        sig_class = "buy"
+    if signal["action"] == "REDUCE_RISK":
+        sig_class = "risk"
+
+    signals = [
+        {
+            "time": r.time.isoformat(),
+            "action": r.action,
+            "message": r.message,
+            "eth_price": round(r.eth_price, 2),
+            "btc_price": round(r.btc_price, 2),
+        }
+        for r in recent
+    ]
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "market": market,
+            "signal": signal,
+            "signals": signals,
+            "pos": POSITION_STATE,
+            "sig_class": sig_class
+        }
+    )
+
+
+# -----------------------------
+# Poller loop
+# -----------------------------
+async def poll_once():
+    eth_4h = await fetch_klines("ETHUSDT", "4h", limit=300)
+    btc_4h = await fetch_klines("BTCUSDT", "4h", limit=300)
+    ethbtc_4h = await fetch_klines("ETHBTC", "4h", limit=300)
+
+    m = compute_market(eth_4h, btc_4h, ethbtc_4h)
+    sig = decide_signal(m, POSITION_STATE)
+
+    async with AsyncSessionLocal() as session:
+        snap = MarketSnapshot(
+            time=m.time,
+            eth_price=m.eth_price,
+            btc_price=m.btc_price,
+            ethbtc_price=m.ethbtc_price,
+
+            eth_rsi_4h=m.eth_rsi_4h,
+            btc_rsi_4h=m.btc_rsi_4h,
+            ethbtc_rsi_4h=m.ethbtc_rsi_4h,
+
+            eth_macd_hist_4h=m.eth_macd_hist_4h,
+            btc_macd_hist_4h=m.btc_macd_hist_4h,
+            ethbtc_macd_hist_4h=m.ethbtc_macd_hist_4h,
+
+            eth_bb_lower_4h=m.eth_bb_lower_4h,
+            eth_bb_mid_4h=m.eth_bb_mid_4h,
+            eth_bb_upper_4h=m.eth_bb_upper_4h,
+
+            btc_ema34_4h=m.btc_ema34_4h if not math.isnan(m.btc_ema34_4h) else 0.0,
+            btc_ema200_4h=m.btc_ema200_4h if not math.isnan(m.btc_ema200_4h) else 0.0,
+            btc_breakdown=1 if m.btc_breakdown else 0,
+        )
+        session.add(snap)
+
+        if sig.action != "HOLD":
+            ok = await should_emit(session, sig.action, m.eth_price)
+            if ok:
+                session.add(SignalLog(
+                    time=m.time,
+                    action=sig.action,
+                    confidence=sig.confidence,
+                    message=sig.message,
+                    meta=sig.meta,
+                    eth_price=m.eth_price,
+                    btc_price=m.btc_price,
+                    ethbtc_price=m.ethbtc_price
+                ))
+                await update_emit_state(session, sig.action, m.eth_price)
+
+                log.info("EMIT %s | ETH %.2f | BTC %.2f", sig.action, m.eth_price, m.btc_price)
+                await send_telegram(format_signal_message(sig, m))
+            else:
+                log.info("SKIP (cooldown) %s | ETH %.2f", sig.action, m.eth_price)
+
+        await session.commit()
+
+
+async def poller_loop():
+    while True:
+        try:
+            await poll_once()
+        except Exception as e:
+            log.exception("Poll error: %s", e)
+        await asyncio.sleep(settings.POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), reload=False)
