@@ -58,6 +58,17 @@ PUSHOVER_SOUND = os.environ.get("PUSHOVER_SOUND", "cash")
 BINANCE_BASE = "https://api.binance.com"
 KLINES_PATH = "/api/v3/klines"
 
+
+# =========================
+# In-memory cache / heartbeat (works even if DB is down)
+# =========================
+import threading
+
+_cache_lock = threading.Lock()
+LAST_MARKET_CACHE: Dict[str, Any] = {}
+LAST_MARKET_TS: float = 0.0          # time.time()
+LAST_LOOP_TS: float = 0.0            # time.time()
+LAST_ERROR: str = ""
 # =========================
 # DB setup
 # =========================
@@ -562,6 +573,8 @@ def run_loop_forever():
     while True:
         db = None
         try:
+            global LAST_LOOP_TS, LAST_ERROR
+            LAST_LOOP_TS = time.time()
             db = SessionLocal() if SessionLocal else None
             m = build_market()
             p = build_position()
@@ -603,10 +616,18 @@ def run_loop_forever():
                 "eth_bb_upper_4h": m.eth_bb_upper_4h,
                 "btc_ema200_4h": m.btc_ema200_4h,
             }
+# Update in-memory cache (always)
+with _cache_lock:
+    LAST_MARKET_CACHE = cache
+    LAST_MARKET_TS = time.time()
+
+# Persist to DB if available
             if db is not None:
                 kv_set(db, "last_market_json", json.dumps(cache))
 
         except Exception as e:
+            global LAST_ERROR
+            LAST_ERROR = f"{type(e).__name__}: {str(e)[:800]}"
             # Error notify max 1h
             try:
                 if db is None and SessionLocal:
@@ -632,13 +653,60 @@ def run_loop_forever():
 
 @app.get("/api/state")
 def api_state(db: Optional[Session] = Depends(get_db)):
-    last_market = kv_get(db, "last_market_json", "{}")
-    try:
-        last_market_obj = json.loads(last_market)
-    except Exception:
-        last_market_obj = {}
+    # Prefer in-memory cache (updates even when DB is flaky)
+    with _cache_lock:
+        last_market_obj = dict(LAST_MARKET_CACHE) if LAST_MARKET_CACHE else {}
+
+    # Fallback to DB cache
+    if not last_market_obj and db is not None:
+        raw = kv_get(db, "last_market_json", "{}")
+        try:
+            last_market_obj = json.loads(raw)
+        except Exception:
+            last_market_obj = {}
+
+    # If stale, refresh on-demand (so dashboard stays current)
+    def _is_stale(obj: Dict[str, Any]) -> bool:
+        try:
+            t = obj.get("time", "")
+            if not t:
+                return True
+            # handle "2025-12-17T15:26:45.86Z" or "...+00:00"
+            t2 = t.replace("Z", "+00:00")
+            ts = dt.datetime.fromisoformat(t2).timestamp()
+            return (time.time() - ts) > max(RUN_EVERY_SECONDS * 2, 90)
+        except Exception:
+            return True
+
+    if _is_stale(last_market_obj):
+        try:
+            m = build_market()
+            refreshed = {
+                "time": m.time.isoformat() + "Z",
+                "eth_price": m.eth_price,
+                "btc_price": m.btc_price,
+                "ethbtc_price": m.ethbtc_price,
+                "eth_rsi_4h": m.eth_rsi_4h,
+                "btc_rsi_4h": m.btc_rsi_4h,
+                "ethbtc_rsi_4h": m.ethbtc_rsi_4h,
+                "eth_bb_lower_4h": m.eth_bb_lower_4h,
+                "eth_bb_mid_4h": m.eth_bb_mid_4h,
+                "eth_bb_upper_4h": m.eth_bb_upper_4h,
+                "btc_ema200_4h": m.btc_ema200_4h,
+            }
+            with _cache_lock:
+                LAST_MARKET_CACHE.clear()
+                LAST_MARKET_CACHE.update(refreshed)
+                global LAST_MARKET_TS
+                LAST_MARKET_TS = time.time()
+            last_market_obj = refreshed
+            if db is not None:
+                kv_set(db, "last_market_json", json.dumps(refreshed))
+        except Exception:
+            pass
 
     return {
+
         "ok": True,
         "config": {
             "RUN_EVERY_SECONDS": RUN_EVERY_SECONDS,
@@ -662,6 +730,24 @@ def api_state(db: Optional[Session] = Depends(get_db)):
             "last_action_ts": kv_get(db, "last_action_ts", "0"),
         },
         "market": last_market_obj,
+    }
+
+
+@app.get("/api/health")
+def api_health(db: Optional[Session] = Depends(get_db)):
+    with _cache_lock:
+        lm = dict(LAST_MARKET_CACHE) if LAST_MARKET_CACHE else {}
+        lts = LAST_MARKET_TS
+        loop_ts = LAST_LOOP_TS
+        err = LAST_ERROR
+    return {
+        "ok": True,
+        "now": dt.datetime.utcnow().isoformat() + "Z",
+        "last_loop_age_sec": (time.time() - loop_ts) if loop_ts else None,
+        "last_market_age_sec": (time.time() - lts) if lts else None,
+        "last_market_time": lm.get("time"),
+        "db_enabled": db is not None,
+        "last_error": err,
     }
 
 @app.get("/api/signals")
