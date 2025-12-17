@@ -749,88 +749,110 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
 
     <style>
       :root {{
-        --bg:#f6f8fc;
-        --card:#ffffff;
-        --text:#0f172a;
-        --muted:#64748b;
-        --border:#e5eaf3;
-        --codebg:#f8fafc;
-        --shadow: 0 10px 30px rgba(15,23,42,.08);
-        --shadow2: 0 6px 18px rgba(15,23,42,.06);
-        --radius: 18px;
-        --blue:#2563eb;
-        --blueSoft:#e8f0ff;
-        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --text: #0f172a;
+        --muted: #64748b;
+        --border: #e6e8ee;
+
+        --green: #00b37e;
+        --green-soft: rgba(0,179,126,.12);
+
+        --radius: 14px;
+        --shadow: 0 1px 0 rgba(15,23,42,.04);
+
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+        --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
       }}
 
-      *{{ box-sizing:border-box; }}
+      * {{ box-sizing: border-box; }}
+
       body {{
-        margin:0;
-        padding:24px;
+        margin: 0;
+        padding: 24px;
         font-family: var(--sans);
-        background:
-          radial-gradient(1200px 600px at 20% 0%, #eaf2ff 0%, transparent 60%),
-          radial-gradient(900px 500px at 100% 20%, #eef2ff 0%, transparent 55%),
-          var(--bg);
-        color:var(--text);
+        background: var(--bg);
+        color: var(--text);
       }}
 
-      .wrap {{ max-width: 1200px; margin: 0 auto; }}
+      .wrap {{
+        max-width: 1200px;
+        margin: 0 auto;
+      }}
 
+      /* ===== Topbar ===== */
       .topbar {{
         display:flex;
-        align-items:flex-end;
         justify-content:space-between;
+        align-items:flex-end;
         gap:16px;
-        margin-bottom:16px;
+        margin-bottom:18px;
       }}
+
       .title {{
-        font-size:20px;
-        font-weight:800;
-        letter-spacing:.2px;
+        font-size:22px;
+        font-weight:900;
+        letter-spacing:-0.01em;
       }}
+
       .subtitle {{
         margin-top:4px;
-        color:var(--muted);
         font-size:13px;
+        font-weight:600;
+        color:var(--muted);
       }}
-      .chips {{ display:flex; gap:10px; flex-wrap:wrap; }}
+
+      .chips {{
+        display:flex;
+        gap:10px;
+        flex-wrap:wrap;
+      }}
+
       .chip {{
         display:inline-flex;
         align-items:center;
         gap:8px;
-        padding:8px 12px;
-        background: var(--card);
+        padding:7px 12px;
+        background: var(--panel);
         border:1px solid var(--border);
         border-radius:999px;
-        box-shadow: var(--shadow2);
         font-size:13px;
-        color:var(--muted);
+        font-weight:700;
+        color:#334155;
         text-decoration:none;
-        transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
-      }}
-      .chip:hover {{
-        transform: translateY(-1px);
-        box-shadow: var(--shadow);
-        border-color:#d7deea;
-      }}
-      .dot {{
-        width:8px; height:8px; border-radius:999px;
-        background: var(--blue);
-        box-shadow: 0 0 0 4px var(--blueSoft);
       }}
 
-      .row {{ display:flex; gap:16px; flex-wrap:wrap; }}
+      .chip:hover {{
+        background:#f3f4f6;
+      }}
+
+      .dot {{
+        width:8px;
+        height:8px;
+        border-radius:999px;
+        background: var(--green);
+        box-shadow: 0 0 0 4px var(--green-soft);
+      }}
+
+      /* ===== Layout ===== */
+      .row {{
+        display:flex;
+        gap:16px;
+        flex-wrap:wrap;
+      }}
 
       .card {{
-        background:var(--card);
+        background:var(--panel);
         border:1px solid var(--border);
         border-radius: var(--radius);
         padding:16px;
         min-width:320px;
         flex:1;
-        box-shadow: var(--shadow2);
+        box-shadow: var(--shadow);
+      }}
+
+      .card.full {{
+        margin-top:16px;
       }}
 
       .h {{
@@ -838,80 +860,97 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         align-items:center;
         justify-content:space-between;
         gap:12px;
-        font-size:14px;
-        font-weight:800;
         margin-bottom:10px;
-        color:var(--text);
+        font-size:13px;
+        font-weight:900;
+        letter-spacing:.02em;
+        text-transform:uppercase;
+        color:#0f172a;
       }}
 
-      .muted {{ color:var(--muted); font-size:13px; line-height:1.4; }}
+      .muted {{
+        color:var(--muted);
+        font-size:13px;
+        line-height:1.4;
+        font-weight:600;
+      }}
 
+      /* ===== Code / JSON ===== */
       .pre {{
-        background: var(--codebg);
+        background:#fbfbfc;
         border:1px solid var(--border);
-        border-radius: 14px;
-        padding:12px 12px;
+        border-radius:12px;
+        padding:12px;
         overflow:auto;
         font-family: var(--mono);
         font-size:12px;
         line-height:1.55;
-        color:#0b1220;
+        color:#020617;
       }}
 
       code {{
         font-family: var(--mono);
-        background: #eef2ff;
-        border:1px solid #e5e7ff;
+        background:#f3f4f6;
+        border:1px solid #e5e7eb;
         padding:2px 6px;
         border-radius:999px;
-        color:#1e40af;
         font-size:12px;
+        font-weight:700;
       }}
 
       a {{
-        color: var(--blue);
-        text-decoration: none;
-        font-weight:600;
+        color: var(--green);
+        text-decoration:none;
+        font-weight:700;
       }}
-      a:hover {{ text-decoration: underline; }}
 
+      a:hover {{
+        text-decoration:underline;
+      }}
+
+      /* ===== Table ===== */
       table {{
         width:100%;
         border-collapse: separate;
         border-spacing: 0;
         margin-top:12px;
-        overflow:hidden;
         border:1px solid var(--border);
-        border-radius: 16px;
-        background: var(--card);
+        border-radius:14px;
+        background: var(--panel);
+        overflow:hidden;
       }}
-      thead th {{
-        text-align:left;
-        color: var(--muted);
-        font-weight:800;
-        font-size:12px;
-        padding:12px 12px;
-        background: #fbfcff;
-        border-bottom:1px solid var(--border);
-        position: sticky;
-        top: 0;
-        z-index: 1;
-      }}
-      tbody td {{
-        padding:12px 12px;
-        font-size:13px;
-        vertical-align:top;
-        border-bottom:1px solid var(--border);
-      }}
-      tbody tr:hover td {{ background: #f8fbff; }}
-      tbody tr:last-child td {{ border-bottom:none; }}
 
-      .card.full {{ margin-top:16px; }}
+      thead th {{
+        background:#fafafa;
+        color:#475569;
+        font-size:12px;
+        font-weight:900;
+        padding:10px 12px;
+        border-bottom:1px solid var(--border);
+        text-align:left;
+        position:sticky;
+        top:0;
+      }}
+
+      tbody td {{
+        padding:10px 12px;
+        font-size:13px;
+        border-bottom:1px solid var(--border);
+        vertical-align:top;
+      }}
+
+      tbody tr:hover td {{
+        background:#f9fafb;
+      }}
+
+      tbody tr:last-child td {{
+        border-bottom:none;
+      }}
 
       @media (max-width: 720px) {{
         body {{ padding:16px; }}
-        .card {{ min-width: 100%; }}
-        .topbar {{ align-items:flex-start; flex-direction:column; }}
+        .card {{ min-width:100%; }}
+        .topbar {{ flex-direction:column; align-items:flex-start; }}
       }}
     </style>
   </head>
@@ -921,37 +960,50 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
       <div class="topbar">
         <div>
           <div class="title">{APP_TITLE}</div>
-          <div class="subtitle">Dashboard • FastAPI render</div>
+          <div class="subtitle">Service overview · FastAPI dashboard</div>
         </div>
         <div class="chips">
-          <a class="chip" href="/api/state"><span class="dot"></span> /api/state</a>
-          <a class="chip" href="/api/signals?limit=100"><span class="dot"></span> /api/signals</a>
+          <a class="chip" href="/api/state"><span class="dot"></span> API State</a>
+          <a class="chip" href="/api/signals?limit=100"><span class="dot"></span> Signals</a>
         </div>
       </div>
 
       <div class="row">
         <div class="card">
-          <div class="h"><span>Market (last)</span><span class="muted">Live snapshot</span></div>
+          <div class="h">Market <span class="muted">Last snapshot</span></div>
           <pre class="pre">{esc(json.dumps(last_market, indent=2, ensure_ascii=False))}</pre>
           <div class="muted" style="margin-top:10px">
-            Endpoints: <a href="/api/state">/api/state</a> · <a href="/api/signals?limit=100">/api/signals</a>
+            Endpoints:
+            <a href="/api/state">/api/state</a> ·
+            <a href="/api/signals?limit=100">/api/signals</a>
           </div>
         </div>
 
         <div class="card">
-          <div class="h"><span>Config</span><span class="muted">Runtime</span></div>
+          <div class="h">Config <span class="muted">Runtime</span></div>
           <pre class="pre">{esc(json.dumps(cfg, indent=2, ensure_ascii=False))}</pre>
-          <div class="muted" style="margin-top:10px">Binance: Spot public klines (ETHUSDT/BTCUSDT/ETHBTC 4h)</div>
+          <div class="muted" style="margin-top:10px">
+            Binance Spot · ETHUSDT / BTCUSDT / ETHBTC · 4H
+          </div>
         </div>
 
         {latest_html}
       </div>
 
       <div class="card full">
-        <div class="h"><span>Recent signals</span><span class="muted">Latest events</span></div>
+        <div class="h">Recent Signals <span class="muted">Latest events</span></div>
         <table>
           <thead>
-            <tr><th>Time</th><th>Action</th><th>State</th><th>Conf</th><th>Message</th><th>ETH</th><th>BTC</th><th>ETHBTC</th></tr>
+            <tr>
+              <th>Time</th>
+              <th>Action</th>
+              <th>State</th>
+              <th>Conf</th>
+              <th>Message</th>
+              <th>ETH</th>
+              <th>BTC</th>
+              <th>ETHBTC</th>
+            </tr>
           </thead>
           <tbody>{rows}</tbody>
         </table>
