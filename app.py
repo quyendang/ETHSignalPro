@@ -676,64 +676,60 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
     return f"""
 <html>
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <title>{APP_TITLE}</title>
 
     <style>
-      :root{
+      :root {{
         --bg:#f6f8fc;
         --card:#ffffff;
         --text:#0f172a;
         --muted:#64748b;
         --border:#e5eaf3;
-        --soft:#f1f5ff;
         --codebg:#f8fafc;
         --shadow: 0 10px 30px rgba(15,23,42,.08);
         --shadow2: 0 6px 18px rgba(15,23,42,.06);
         --radius: 18px;
-
         --blue:#2563eb;
         --blueSoft:#e8f0ff;
-
         --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
         --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-      }
+      }}
 
-      *{ box-sizing:border-box; }
-      body{
+      *{{ box-sizing:border-box; }}
+      body {{
         margin:0;
         padding:24px;
         font-family: var(--sans);
-        background: radial-gradient(1200px 600px at 20% 0%, #eaf2ff 0%, transparent 60%),
-                    radial-gradient(900px 500px at 100% 20%, #eef2ff 0%, transparent 55%),
-                    var(--bg);
+        background:
+          radial-gradient(1200px 600px at 20% 0%, #eaf2ff 0%, transparent 60%),
+          radial-gradient(900px 500px at 100% 20%, #eef2ff 0%, transparent 55%),
+          var(--bg);
         color:var(--text);
-      }
+      }}
 
-      /* container */
-      .wrap{ max-width: 1200px; margin: 0 auto; }
+      .wrap {{ max-width: 1200px; margin: 0 auto; }}
 
-      /* top header */
-      .topbar{
+      .topbar {{
         display:flex;
         align-items:flex-end;
         justify-content:space-between;
         gap:16px;
         margin-bottom:16px;
-      }
-      .title{
+      }}
+      .title {{
         font-size:20px;
         font-weight:800;
         letter-spacing:.2px;
-      }
-      .subtitle{
+      }}
+      .subtitle {{
         margin-top:4px;
         color:var(--muted);
         font-size:13px;
-      }
-      .chips{ display:flex; gap:10px; flex-wrap:wrap; }
-      .chip{
+      }}
+      .chips {{ display:flex; gap:10px; flex-wrap:wrap; }}
+      .chip {{
         display:inline-flex;
         align-items:center;
         gap:8px;
@@ -746,25 +742,21 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         color:var(--muted);
         text-decoration:none;
         transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
-      }
-      .chip:hover{
+      }}
+      .chip:hover {{
         transform: translateY(-1px);
         box-shadow: var(--shadow);
         border-color:#d7deea;
-      }
-      .dot{
+      }}
+      .dot {{
         width:8px; height:8px; border-radius:999px;
         background: var(--blue);
         box-shadow: 0 0 0 4px var(--blueSoft);
-      }
+      }}
 
-      .row{
-        display:flex;
-        gap:16px;
-        flex-wrap:wrap;
-      }
+      .row {{ display:flex; gap:16px; flex-wrap:wrap; }}
 
-      .card{
+      .card {{
         background:var(--card);
         border:1px solid var(--border);
         border-radius: var(--radius);
@@ -772,9 +764,9 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         min-width:320px;
         flex:1;
         box-shadow: var(--shadow2);
-      }
+      }}
 
-      .h{
+      .h {{
         display:flex;
         align-items:center;
         justify-content:space-between;
@@ -783,11 +775,11 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         font-weight:800;
         margin-bottom:10px;
         color:var(--text);
-      }
+      }}
 
-      .muted{ color:var(--muted); font-size:13px; line-height:1.4; }
+      .muted {{ color:var(--muted); font-size:13px; line-height:1.4; }}
 
-      .pre{
+      .pre {{
         background: var(--codebg);
         border:1px solid var(--border);
         border-radius: 14px;
@@ -797,9 +789,9 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         font-size:12px;
         line-height:1.55;
         color:#0b1220;
-      }
+      }}
 
-      code{
+      code {{
         font-family: var(--mono);
         background: #eef2ff;
         border:1px solid #e5e7ff;
@@ -807,17 +799,16 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         border-radius:999px;
         color:#1e40af;
         font-size:12px;
-      }
+      }}
 
-      a{
+      a {{
         color: var(--blue);
         text-decoration: none;
         font-weight:600;
-      }
-      a:hover{ text-decoration: underline; }
+      }}
+      a:hover {{ text-decoration: underline; }}
 
-      /* table */
-      table{
+      table {{
         width:100%;
         border-collapse: separate;
         border-spacing: 0;
@@ -826,41 +817,35 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         border:1px solid var(--border);
         border-radius: 16px;
         background: var(--card);
-      }
-      thead th{
+      }}
+      thead th {{
         text-align:left;
         color: var(--muted);
         font-weight:800;
         font-size:12px;
         padding:12px 12px;
-        background: linear-gradient(180deg, #fbfcff 0%, #f7f9ff 100%);
+        background: #fbfcff;
         border-bottom:1px solid var(--border);
         position: sticky;
         top: 0;
         z-index: 1;
-      }
-      tbody td{
+      }}
+      tbody td {{
         padding:12px 12px;
         font-size:13px;
         vertical-align:top;
         border-bottom:1px solid var(--border);
-      }
-      tbody tr:hover td{
-        background: #f8fbff;
-      }
-      tbody tr:last-child td{ border-bottom:none; }
+      }}
+      tbody tr:hover td {{ background: #f8fbff; }}
+      tbody tr:last-child td {{ border-bottom:none; }}
 
-      /* small helpers */
-      .spacer{ height:16px; }
-      .card.full{ margin-top:16px; }
-      .right{ text-align:right; }
+      .card.full {{ margin-top:16px; }}
 
-      /* mobile */
-      @media (max-width: 720px){
-        body{ padding:16px; }
-        .card{ min-width: 100%; }
-        .topbar{ align-items:flex-start; flex-direction:column; }
-      }
+      @media (max-width: 720px) {{
+        body {{ padding:16px; }}
+        .card {{ min-width: 100%; }}
+        .topbar {{ align-items:flex-start; flex-direction:column; }}
+      }}
     </style>
   </head>
 
@@ -869,7 +854,7 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
       <div class="topbar">
         <div>
           <div class="title">{APP_TITLE}</div>
-          <div class="subtitle">Dashboard • FastAPI render • Flat & bright UI</div>
+          <div class="subtitle">Dashboard • FastAPI render</div>
         </div>
         <div class="chips">
           <a class="chip" href="/api/state"><span class="dot"></span> /api/state</a>
@@ -879,10 +864,7 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
 
       <div class="row">
         <div class="card">
-          <div class="h">
-            <span>Market (last)</span>
-            <span class="muted">Live snapshot</span>
-          </div>
+          <div class="h"><span>Market (last)</span><span class="muted">Live snapshot</span></div>
           <pre class="pre">{esc(json.dumps(last_market, indent=2, ensure_ascii=False))}</pre>
           <div class="muted" style="margin-top:10px">
             Endpoints: <a href="/api/state">/api/state</a> · <a href="/api/signals?limit=100">/api/signals</a>
@@ -890,36 +872,19 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         </div>
 
         <div class="card">
-          <div class="h">
-            <span>Config</span>
-            <span class="muted">Runtime</span>
-          </div>
+          <div class="h"><span>Config</span><span class="muted">Runtime</span></div>
           <pre class="pre">{esc(json.dumps(cfg, indent=2, ensure_ascii=False))}</pre>
-          <div class="muted" style="margin-top:10px">
-            Binance: Spot public klines (ETHUSDT/BTCUSDT/ETHBTC 4h)
-          </div>
+          <div class="muted" style="margin-top:10px">Binance: Spot public klines (ETHUSDT/BTCUSDT/ETHBTC 4h)</div>
         </div>
 
         {latest_html}
       </div>
 
       <div class="card full">
-        <div class="h">
-          <span>Recent signals</span>
-          <span class="muted">Latest events</span>
-        </div>
+        <div class="h"><span>Recent signals</span><span class="muted">Latest events</span></div>
         <table>
           <thead>
-            <tr>
-              <th>Time</th>
-              <th>Action</th>
-              <th>State</th>
-              <th>Conf</th>
-              <th>Message</th>
-              <th>ETH</th>
-              <th>BTC</th>
-              <th>ETHBTC</th>
-            </tr>
+            <tr><th>Time</th><th>Action</th><th>State</th><th>Conf</th><th>Message</th><th>ETH</th><th>BTC</th><th>ETHBTC</th></tr>
           </thead>
           <tbody>{rows}</tbody>
         </table>
