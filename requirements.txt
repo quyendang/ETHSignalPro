@@ -9,3 +9,4 @@ numpy
 jinja2
 requests
 psycopg2
+psycopg2-binary
