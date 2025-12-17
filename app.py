@@ -674,50 +674,258 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
     }
 
     return f"""
-    <html><head>
-      <meta charset="utf-8"/>
-      <title>{APP_TITLE}</title>
-      <style>
-        body {{ font-family: ui-sans-serif, system-ui; background:#0b0f15; color:#e6edf3; padding:24px; }}
-        .row {{ display:flex; gap:16px; flex-wrap:wrap; }}
-        .card {{ background:#111827; border:1px solid #1f2937; border-radius:16px; padding:16px; min-width:320px; flex:1; }}
-        .h {{ font-size:18px; font-weight:700; margin-bottom:10px; }}
-        .muted {{ color:#9ca3af; }}
-        .pre {{ background:#0b1220; border:1px solid #1f2937; border-radius:12px; padding:12px; overflow:auto; }}
-        table {{ width:100%; border-collapse:collapse; margin-top:16px; }}
-        th, td {{ border-bottom:1px solid #1f2937; padding:10px; font-size:13px; vertical-align:top; }}
-        th {{ text-align:left; color:#9ca3af; font-weight:600; }}
-        .msg {{ margin-top:8px; }}
-        code {{ color:#93c5fd; }}
-        a {{ color:#60a5fa; }}
-      </style>
-    </head>
-    <body>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{APP_TITLE}</title>
+
+    <style>
+      :root{
+        --bg:#f6f8fc;
+        --card:#ffffff;
+        --text:#0f172a;
+        --muted:#64748b;
+        --border:#e5eaf3;
+        --soft:#f1f5ff;
+        --codebg:#f8fafc;
+        --shadow: 0 10px 30px rgba(15,23,42,.08);
+        --shadow2: 0 6px 18px rgba(15,23,42,.06);
+        --radius: 18px;
+
+        --blue:#2563eb;
+        --blueSoft:#e8f0ff;
+
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      }
+
+      *{ box-sizing:border-box; }
+      body{
+        margin:0;
+        padding:24px;
+        font-family: var(--sans);
+        background: radial-gradient(1200px 600px at 20% 0%, #eaf2ff 0%, transparent 60%),
+                    radial-gradient(900px 500px at 100% 20%, #eef2ff 0%, transparent 55%),
+                    var(--bg);
+        color:var(--text);
+      }
+
+      /* container */
+      .wrap{ max-width: 1200px; margin: 0 auto; }
+
+      /* top header */
+      .topbar{
+        display:flex;
+        align-items:flex-end;
+        justify-content:space-between;
+        gap:16px;
+        margin-bottom:16px;
+      }
+      .title{
+        font-size:20px;
+        font-weight:800;
+        letter-spacing:.2px;
+      }
+      .subtitle{
+        margin-top:4px;
+        color:var(--muted);
+        font-size:13px;
+      }
+      .chips{ display:flex; gap:10px; flex-wrap:wrap; }
+      .chip{
+        display:inline-flex;
+        align-items:center;
+        gap:8px;
+        padding:8px 12px;
+        background: var(--card);
+        border:1px solid var(--border);
+        border-radius:999px;
+        box-shadow: var(--shadow2);
+        font-size:13px;
+        color:var(--muted);
+        text-decoration:none;
+        transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+      }
+      .chip:hover{
+        transform: translateY(-1px);
+        box-shadow: var(--shadow);
+        border-color:#d7deea;
+      }
+      .dot{
+        width:8px; height:8px; border-radius:999px;
+        background: var(--blue);
+        box-shadow: 0 0 0 4px var(--blueSoft);
+      }
+
+      .row{
+        display:flex;
+        gap:16px;
+        flex-wrap:wrap;
+      }
+
+      .card{
+        background:var(--card);
+        border:1px solid var(--border);
+        border-radius: var(--radius);
+        padding:16px;
+        min-width:320px;
+        flex:1;
+        box-shadow: var(--shadow2);
+      }
+
+      .h{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:12px;
+        font-size:14px;
+        font-weight:800;
+        margin-bottom:10px;
+        color:var(--text);
+      }
+
+      .muted{ color:var(--muted); font-size:13px; line-height:1.4; }
+
+      .pre{
+        background: var(--codebg);
+        border:1px solid var(--border);
+        border-radius: 14px;
+        padding:12px 12px;
+        overflow:auto;
+        font-family: var(--mono);
+        font-size:12px;
+        line-height:1.55;
+        color:#0b1220;
+      }
+
+      code{
+        font-family: var(--mono);
+        background: #eef2ff;
+        border:1px solid #e5e7ff;
+        padding:2px 6px;
+        border-radius:999px;
+        color:#1e40af;
+        font-size:12px;
+      }
+
+      a{
+        color: var(--blue);
+        text-decoration: none;
+        font-weight:600;
+      }
+      a:hover{ text-decoration: underline; }
+
+      /* table */
+      table{
+        width:100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        margin-top:12px;
+        overflow:hidden;
+        border:1px solid var(--border);
+        border-radius: 16px;
+        background: var(--card);
+      }
+      thead th{
+        text-align:left;
+        color: var(--muted);
+        font-weight:800;
+        font-size:12px;
+        padding:12px 12px;
+        background: linear-gradient(180deg, #fbfcff 0%, #f7f9ff 100%);
+        border-bottom:1px solid var(--border);
+        position: sticky;
+        top: 0;
+        z-index: 1;
+      }
+      tbody td{
+        padding:12px 12px;
+        font-size:13px;
+        vertical-align:top;
+        border-bottom:1px solid var(--border);
+      }
+      tbody tr:hover td{
+        background: #f8fbff;
+      }
+      tbody tr:last-child td{ border-bottom:none; }
+
+      /* small helpers */
+      .spacer{ height:16px; }
+      .card.full{ margin-top:16px; }
+      .right{ text-align:right; }
+
+      /* mobile */
+      @media (max-width: 720px){
+        body{ padding:16px; }
+        .card{ min-width: 100%; }
+        .topbar{ align-items:flex-start; flex-direction:column; }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="wrap">
+      <div class="topbar">
+        <div>
+          <div class="title">{APP_TITLE}</div>
+          <div class="subtitle">Dashboard • FastAPI render • Flat & bright UI</div>
+        </div>
+        <div class="chips">
+          <a class="chip" href="/api/state"><span class="dot"></span> /api/state</a>
+          <a class="chip" href="/api/signals?limit=100"><span class="dot"></span> /api/signals</a>
+        </div>
+      </div>
+
       <div class="row">
         <div class="card">
-          <div class="h">Market (last)</div>
+          <div class="h">
+            <span>Market (last)</span>
+            <span class="muted">Live snapshot</span>
+          </div>
           <pre class="pre">{esc(json.dumps(last_market, indent=2, ensure_ascii=False))}</pre>
-          <div class="muted">
+          <div class="muted" style="margin-top:10px">
             Endpoints: <a href="/api/state">/api/state</a> · <a href="/api/signals?limit=100">/api/signals</a>
           </div>
         </div>
+
         <div class="card">
-          <div class="h">Config</div>
+          <div class="h">
+            <span>Config</span>
+            <span class="muted">Runtime</span>
+          </div>
           <pre class="pre">{esc(json.dumps(cfg, indent=2, ensure_ascii=False))}</pre>
-          <div class="muted">Binance: Spot public klines (ETHUSDT/BTCUSDT/ETHBTC 4h)</div>
+          <div class="muted" style="margin-top:10px">
+            Binance: Spot public klines (ETHUSDT/BTCUSDT/ETHBTC 4h)
+          </div>
         </div>
+
         {latest_html}
       </div>
 
-      <div class="card" style="margin-top:16px">
-        <div class="h">Recent signals</div>
+      <div class="card full">
+        <div class="h">
+          <span>Recent signals</span>
+          <span class="muted">Latest events</span>
+        </div>
         <table>
           <thead>
-            <tr><th>Time</th><th>Action</th><th>State</th><th>Conf</th><th>Message</th><th>ETH</th><th>BTC</th><th>ETHBTC</th></tr>
+            <tr>
+              <th>Time</th>
+              <th>Action</th>
+              <th>State</th>
+              <th>Conf</th>
+              <th>Message</th>
+              <th>ETH</th>
+              <th>BTC</th>
+              <th>ETHBTC</th>
+            </tr>
           </thead>
           <tbody>{rows}</tbody>
         </table>
       </div>
-    </body></html>
+    </div>
+  </body>
+</html>
     """
 
