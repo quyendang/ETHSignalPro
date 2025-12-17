@@ -616,14 +616,14 @@ def run_loop_forever():
                 "eth_bb_upper_4h": m.eth_bb_upper_4h,
                 "btc_ema200_4h": m.btc_ema200_4h,
             }
-# Update in-memory cache (always)
-with _cache_lock:
-    LAST_MARKET_CACHE = cache
-    LAST_MARKET_TS = time.time()
-
-# Persist to DB if available
-            if db is not None:
-                kv_set(db, "last_market_json", json.dumps(cache))
+            # Update in-memory cache (always)
+            with _cache_lock:
+                LAST_MARKET_CACHE = cache
+                LAST_MARKET_TS = time.time()
+            
+            # Persist to DB if available
+                        if db is not None:
+                            kv_set(db, "last_market_json", json.dumps(cache))
 
         except Exception as e:
             global LAST_ERROR
