@@ -10,7 +10,7 @@ import requests
 from fastapi import FastAPI, Depends
 from fastapi.responses import HTMLResponse
 from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, Float, Text, Index
+    create_engine, Column, Integer, String, DateTime, Float, Text, Index, text
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
@@ -43,6 +43,9 @@ CRITICAL_LTV = float(os.environ.get("CRITICAL_LTV", "25"))# %
 ETH_OVERSOLD_RSI = float(os.environ.get("ETH_OVERSOLD_RSI", "32"))
 BTC_BREAKDOWN_RSI = float(os.environ.get("BTC_BREAKDOWN_RSI", "45"))
 BTC_RECOVER_RSI = float(os.environ.get("BTC_RECOVER_RSI", "50"))
+BTC_EMA_BAND = float(os.environ.get("BTC_EMA_BAND", "0.003"))  # 0.3% band để tránh flip quanh EMA
+BTC_CONFIRM_N = int(os.environ.get("BTC_CONFIRM_N", "2"))      # cần N lần breakdown liên tiếp mới bật REDUCE_RISK
+USE_CLOSED_CANDLE = os.environ.get("USE_CLOSED_CANDLE", "1") == "1"  # dùng candle đã đóng để ổn định hơn
 
 # Pushover
 PUSHOVER_ENABLED = os.environ.get("PUSHOVER_ENABLED", "1") == "1"
@@ -95,6 +98,29 @@ def init_db():
     if not engine:
         return
     Base.metadata.create_all(bind=engine)
+
+    # Auto-migrate: create_all() không ALTER bảng đã tồn tại
+    # -> thêm các cột còn thiếu để tránh lỗi "column ... does not exist"
+    with engine.begin() as conn:
+        conn.execute(text("""
+        ALTER TABLE signals
+          ADD COLUMN IF NOT EXISTS state VARCHAR(16),
+          ADD COLUMN IF NOT EXISTS action VARCHAR(32),
+          ADD COLUMN IF NOT EXISTS confidence VARCHAR(16),
+          ADD COLUMN IF NOT EXISTS message TEXT,
+          ADD COLUMN IF NOT EXISTS meta_json TEXT,
+          ADD COLUMN IF NOT EXISTS eth_price DOUBLE PRECISION,
+          ADD COLUMN IF NOT EXISTS btc_price DOUBLE PRECISION,
+          ADD COLUMN IF NOT EXISTS ethbtc_price DOUBLE PRECISION;
+        """))
+        conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_signals_created_at
+        ON signals (created_at DESC);
+        """))
+        conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_bot_kv_key
+        ON bot_kv (key);
+        """))
 
 def get_db():
     if not SessionLocal:
@@ -266,28 +292,39 @@ def build_market() -> Market:
     btc_4h = fetch_klines("BTCUSDT", "4h", 220)
     ethbtc_4h = fetch_klines("ETHBTC", "4h", 220)
 
+    
     eth_c = closes_from_klines(eth_4h)
     btc_c = closes_from_klines(btc_4h)
     ethbtc_c = closes_from_klines(ethbtc_4h)
 
-    eth_price = eth_c[-1]
-    btc_price = btc_c[-1]
-    ethbtc_price = ethbtc_c[-1]
+    # Dùng candle đã đóng (ổn định hơn, tránh flip do giá realtime trong candle chưa đóng)
+    if USE_CLOSED_CANDLE and len(eth_c) > 2 and len(btc_c) > 2 and len(ethbtc_c) > 2:
+        eth_c_use = eth_c[:-1]
+        btc_c_use = btc_c[:-1]
+        ethbtc_c_use = ethbtc_c[:-1]
+    else:
+        eth_c_use = eth_c
+        btc_c_use = btc_c
+        ethbtc_c_use = ethbtc_c
 
-    eth_rsi_series = rsi(eth_c, 14)
-    btc_rsi_series = rsi(btc_c, 14)
-    ethbtc_rsi_series = rsi(ethbtc_c, 14)
+    eth_price = eth_c_use[-1]
+    btc_price = btc_c_use[-1]
+    ethbtc_price = ethbtc_c_use[-1]
+
+    eth_rsi_series = rsi(eth_c_use, 14)
+    btc_rsi_series = rsi(btc_c_use, 14)
+    ethbtc_rsi_series = rsi(ethbtc_c_use, 14)
 
     eth_rsi_4h = last_finite(eth_rsi_series) or 50.0
     btc_rsi_4h = last_finite(btc_rsi_series) or 50.0
     ethbtc_rsi_4h = last_finite(ethbtc_rsi_series) or 50.0
 
-    bb_l, bb_m, bb_u = bbands(eth_c, 20, 2.0)
+    bb_l, bb_m, bb_u = bbands(eth_c_use, 20, 2.0)
     eth_bb_lower_4h = last_finite(bb_l)
     eth_bb_mid_4h = last_finite(bb_m)
     eth_bb_upper_4h = last_finite(bb_u)
 
-    btc_ema200 = ema(btc_c, 200)
+    btc_ema200 = ema(btc_c_use, 200)
     btc_ema200_4h = last_finite(btc_ema200)
 
     return Market(
@@ -330,18 +367,30 @@ class Decision:
     meta: Dict[str, Any]
 
 def btc_breakdown(m: Market) -> Tuple[bool, Dict[str, Any]]:
-    # No hard BTC price. Use EMA200 4H + RSI.
+    # Hysteresis + band quanh EMA200 để tránh flip
     if m.btc_ema200_4h is None:
-        return (m.btc_rsi_4h < (BTC_BREAKDOWN_RSI - 5)), {"method": "rsi_only"}
-    return ((m.btc_price < m.btc_ema200_4h) and (m.btc_rsi_4h < BTC_BREAKDOWN_RSI)), {
-        "method": "ema200+rsi", "btc_ema200_4h": m.btc_ema200_4h
+        return (m.btc_rsi_4h < BTC_BREAKDOWN_RSI), {"method": "rsi_only"}
+
+    band = BTC_EMA_BAND
+    price_bad = m.btc_price < m.btc_ema200_4h * (1 - band)
+    rsi_bad = m.btc_rsi_4h < BTC_BREAKDOWN_RSI
+    return (price_bad and rsi_bad), {
+        "method": "ema200+rsi+band",
+        "btc_ema200_4h": m.btc_ema200_4h,
+        "band": band,
     }
 
 def btc_recover(m: Market) -> Tuple[bool, Dict[str, Any]]:
     if m.btc_ema200_4h is None:
         return (m.btc_rsi_4h >= BTC_RECOVER_RSI), {"method": "rsi_only"}
-    return ((m.btc_price >= m.btc_ema200_4h) and (m.btc_rsi_4h >= BTC_RECOVER_RSI)), {
-        "method": "ema200+rsi", "btc_ema200_4h": m.btc_ema200_4h
+
+    band = BTC_EMA_BAND
+    price_good = m.btc_price > m.btc_ema200_4h * (1 + band)
+    rsi_good = m.btc_rsi_4h >= BTC_RECOVER_RSI
+    return (price_good and rsi_good), {
+        "method": "ema200+rsi+band",
+        "btc_ema200_4h": m.btc_ema200_4h,
+        "band": band,
     }
 
 def decide(m: Market, p: Position) -> Decision:
@@ -517,6 +566,24 @@ def run_loop_forever():
             m = build_market()
             p = build_position()
             d = decide(m, p)
+
+
+            # Confirm N lần breakdown liên tiếp (anti-flip) trước khi nâng lên REDUCE_RISK
+            if db is not None and d.action == "REDUCE_RISK" and d.meta.get("btc_breakdown") is True:
+                streak = int(kv_get(db, "btc_breakdown_streak", "0")) + 1
+                kv_set(db, "btc_breakdown_streak", str(streak))
+                if streak < BTC_CONFIRM_N:
+                    d = Decision(
+                        state="RISK",
+                        action="HOLD",
+                        confidence="med",
+                        message=f"RISK (pending): BTC breakdown {streak}/{BTC_CONFIRM_N} lần → chờ confirm rồi mới REDUCE_RISK.",
+                        meta=d.meta
+                    )
+            else:
+                if db is not None:
+                    kv_set(db, "btc_breakdown_streak", "0")
+
             notify, reason = should_notify(db, d)
 
             if notify:
