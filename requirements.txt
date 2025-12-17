@@ -8,3 +8,4 @@ pydantic-settings
 numpy
 jinja2
 requests
+psycopg2
