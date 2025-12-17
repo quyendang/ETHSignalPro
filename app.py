@@ -622,8 +622,8 @@ def run_loop_forever():
                 LAST_MARKET_TS = time.time()
             
             # Persist to DB if available
-                        if db is not None:
-                            kv_set(db, "last_market_json", json.dumps(cache))
+            if db is not None:
+                kv_set(db, "last_market_json", json.dumps(cache))
 
         except Exception as e:
             global LAST_ERROR
