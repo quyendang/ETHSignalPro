@@ -769,6 +769,72 @@ def api_signals(limit: int = 100, db: Optional[Session] = Depends(get_db)):
         })
     return {"ok": True, "signals": out}
 
+
+@app.get("/api/eth_series")
+def api_eth_series(interval: str = "1h", limit: int = 400):
+    """
+    Returns ETHUSDT close series for Chart.js time scale.
+    data: [{t: <openTime ms>, c: <close>}]
+    """
+    limit = max(10, min(int(limit), 1500))
+    interval = (interval or "1h").strip()
+    kl = fetch_klines("ETHUSDT", interval, limit)
+    out = [{"t": int(k[0]), "c": float(k[4])} for k in kl]
+    return {"symbol": "ETHUSDT", "interval": interval, "data": out}
+
+
+@app.get("/api/signals_points")
+def api_signals_points(
+    limit: int = 200,
+    action_filter: str = "BUY,SELL,REDUCE_RISK,SAFE_HOLD",
+    db: Optional[Session] = Depends(get_db),
+):
+    """
+    Returns signal points for Chart.js scatter overlay.
+    data: [{t: <created_at ms>, p: <eth_price>, action, state, conf, msg}]
+    """
+    if db is None:
+        return {"ok": False, "data": []}
+
+    limit = max(1, min(int(limit), 1000))
+    allow = {a.strip().upper() for a in (action_filter or "").split(",") if a.strip()}
+
+    rows = (
+        db.query(SignalRow)
+        .order_by(SignalRow.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    data = []
+    for r in rows:
+        act = (r.action or "").upper()
+        if allow and act not in allow:
+            continue
+        if r.created_at is None:
+            continue
+
+        # created_at stored as naive UTC
+        t_ms = int(r.created_at.replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
+        p = float(r.eth_price) if r.eth_price is not None else None
+        if p is None or p <= 0:
+            continue
+
+        data.append(
+            {
+                "t": t_ms,
+                "p": p,
+                "action": r.action,
+                "state": r.state,
+                "conf": r.confidence,
+                "msg": r.message,
+            }
+        )
+
+    data.reverse()  # chronological order
+    return {"ok": True, "data": data}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(db: Optional[Session] = Depends(get_db)):
     latest = None
@@ -1074,6 +1140,14 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         {latest_html}
       </div>
 
+
+      <div class="card full">
+        <div class="h">ETH Price + Signals <span class="muted">Line + markers (BUY/SELL/RISK/HOLD)</span></div>
+        <div style="height:320px;">
+          <canvas id="ethChart"></canvas>
+        </div>
+      </div>
+
       <div class="card full">
         <div class="h">Recent Signals <span class="muted">Latest events</span></div>
         <table>
@@ -1093,6 +1167,146 @@ def dashboard(db: Optional[Session] = Depends(get_db)):
         </table>
       </div>
     </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+    <script>
+    (async function initEthChart() {{
+      const canvas = document.getElementById("ethChart");
+      if (!canvas) return;
+
+      async function fetchJSON(url) {{
+        const r = await fetch(url, {{ cache: "no-store" }});
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+      }}
+
+      function toLine(series) {{
+        return (series || []).map(x => ({{ x: x.t, y: x.c }}));
+      }}
+
+      function splitSignals(sig) {{
+        const out = {{ BUY: [], SELL: [], REDUCE_RISK: [], SAFE_HOLD: [] }};
+        (sig || []).forEach(s => {{
+          if (!s || !s.action) return;
+          const key = String(s.action).toUpperCase();
+          if (!out[key]) return;
+          if (!s.t || !s.p) return;
+          out[key].push({{ x: s.t, y: s.p, _meta: s }});
+        }});
+        return out;
+      }}
+
+      let seriesRes, sigRes;
+      try {{
+        [seriesRes, sigRes] = await Promise.all([
+          fetchJSON("/api/eth_series?interval=1h&limit=400"),
+          fetchJSON("/api/signals_points?limit=300"),
+        ]);
+      }} catch (e) {{
+        console.error("chart init fetch error:", e);
+        return;
+      }}
+
+      const lineData = toLine(seriesRes.data);
+      const sm = splitSignals(sigRes.data);
+
+      const chart = new Chart(canvas.getContext("2d"), {{
+        type: "line",
+        data: {{
+          datasets: [
+            {{
+              label: "ETHUSDT",
+              data: lineData,
+              parsing: false,
+              pointRadius: 0,
+              borderWidth: 2,
+              tension: 0.25,
+            }},
+            {{
+              type: "scatter",
+              label: "BUY",
+              data: sm.BUY,
+              parsing: false,
+              pointRadius: 6,
+              pointStyle: "triangle",
+              rotation: 0,
+            }},
+            {{
+              type: "scatter",
+              label: "SELL",
+              data: sm.SELL,
+              parsing: false,
+              pointRadius: 6,
+              pointStyle: "triangle",
+              rotation: 180,
+            }},
+            {{
+              type: "scatter",
+              label: "REDUCE_RISK",
+              data: sm.REDUCE_RISK,
+              parsing: false,
+              pointRadius: 5,
+              pointStyle: "rect",
+            }},
+            {{
+              type: "scatter",
+              label: "SAFE_HOLD",
+              data: sm.SAFE_HOLD,
+              parsing: false,
+              pointRadius: 4,
+              pointStyle: "circle",
+            }},
+          ],
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {{ mode: "nearest", intersect: false }},
+          scales: {{
+            x: {{ type: "time", time: {{ tooltipFormat: "PPpp" }} }},
+            y: {{ beginAtZero: false }},
+          }},
+          plugins: {{
+            tooltip: {{
+              callbacks: {{
+                label: (ctx) => {{
+                  const d = ctx.raw;
+                  if (!d || !d._meta) return `${{ctx.dataset.label}}: ${{ctx.formattedValue}}`;
+                  const m = d._meta;
+                  const conf = m.conf ? ` | ${{m.conf}}` : "";
+                  const state = m.state ? ` | ${{m.state}}` : "";
+                  const msg = m.msg ? ` | ${{m.msg}}` : "";
+                  return `${{m.action}}${{state}}${{conf}}${{msg}}`.trim();
+                }},
+              }},
+            }},
+          }},
+        }},
+      }});
+
+      async function refresh() {{
+        try {{
+          const [ns, ng] = await Promise.all([
+            fetchJSON("/api/eth_series?interval=1h&limit=400"),
+            fetchJSON("/api/signals_points?limit=300"),
+          ]);
+          chart.data.datasets[0].data = toLine(ns.data);
+          const nm = splitSignals(ng.data);
+          chart.data.datasets[1].data = nm.BUY;
+          chart.data.datasets[2].data = nm.SELL;
+          chart.data.datasets[3].data = nm.REDUCE_RISK;
+          chart.data.datasets[4].data = nm.SAFE_HOLD;
+          chart.update("none");
+        }} catch (e) {{
+          console.error("chart refresh error:", e);
+        }}
+      }}
+
+      setInterval(refresh, 60_000);
+    }})();
+    </script>
+
   </body>
 </html>
     """
